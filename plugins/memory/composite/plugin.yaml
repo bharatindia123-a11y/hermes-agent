@@ -1,0 +1,5 @@
+name: composite
+version: 0.1.0
+description: "Composite shell memory provider that safely wraps configured child providers behind one external provider. Disabled by default."
+pip_dependencies: []
+requires_env: []

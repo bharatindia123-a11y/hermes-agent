@@ -69,6 +69,7 @@ from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+from agent.task_contracts import validate_named_workflow_artifact
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
@@ -1988,10 +1989,11 @@ class AIAgent:
                 original_user_message, final_response,
                 session_id=self.session_id or "",
             )
-            self._memory_manager.queue_prefetch_all(
-                original_user_message,
-                session_id=self.session_id or "",
-            )
+            if not (self._cli_filtered_memory_bridge and self._cli_filtered_memory_bridge.is_enabled()):
+                self._memory_manager.queue_prefetch_all(
+                    original_user_message,
+                    session_id=self.session_id or "",
+                )
         except Exception:
             pass
 
@@ -3779,6 +3781,163 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+
+    @staticmethod
+    def _delegate_named_workflow_prompt_block(named_workflow: Optional[Dict[str, Any]]) -> str:
+        if not isinstance(named_workflow, dict):
+            return ""
+        workflow_name = named_workflow.get("workflow_name") or named_workflow.get("name") or "unknown"
+        payload = json.dumps(named_workflow, sort_keys=True, ensure_ascii=False, indent=2)
+        return "\n".join([
+            f"Named workflow activated: {workflow_name}",
+            "<named-workflow>",
+            payload,
+            "</named-workflow>",
+        ])
+
+    def _inject_delegate_named_workflow_prompt_block(self, named_workflow: Optional[Dict[str, Any]]) -> None:
+        block = self._delegate_named_workflow_prompt_block(named_workflow)
+        if not block:
+            return
+        current = self.ephemeral_system_prompt or ""
+        if "<named-workflow>" in current and "</named-workflow>" in current:
+            return
+        self.ephemeral_system_prompt = f"{current.rstrip()}\n\n{block}".strip()
+
+    def activate_delegate_runtime(self, delegate_resolution: Optional[Dict[str, Any]]) -> None:
+        """Activate OMO named-agent runtime state on this foreground child."""
+        resolution = dict(delegate_resolution or {})
+        raw_named_workflow = resolution.get("named_workflow")
+        named_workflow = None
+        if isinstance(raw_named_workflow, dict):
+            named_workflow = validate_named_workflow_artifact(raw_named_workflow).model_dump(by_alias=True)
+            resolution["named_workflow"] = named_workflow
+
+        task_contract = resolution.get("task_contract") if isinstance(resolution.get("task_contract"), dict) else None
+        if task_contract is None and isinstance(named_workflow, dict):
+            execution_contract = named_workflow.get("execution_task_contract")
+            if isinstance(execution_contract, dict):
+                task_contract = execution_contract
+                resolution["task_contract"] = task_contract
+
+        self._delegate_resolution = resolution
+        self._delegate_runtime_mode = resolution.get("runtime_mode")
+        self._delegate_named_workflow = named_workflow
+        self._delegate_task_contract = task_contract
+        self._inject_delegate_named_workflow_prompt_block(named_workflow)
+
+        required_tools = set()
+        if task_contract:
+            raw_required = task_contract.get("required_tools") or []
+            if isinstance(raw_required, list):
+                required_tools = {str(item).strip() for item in raw_required if str(item).strip()}
+        self._delegate_required_tools = required_tools
+        if required_tools and self.valid_tool_names:
+            missing = sorted(required_tools - set(self.valid_tool_names))
+            if missing:
+                raise ValueError(f"task_contract.required_tools unavailable in child foreground runtime: {missing}")
+
+    @staticmethod
+    def _decode_delegate_tool_result_payload(content: Any) -> Optional[Dict[str, Any]]:
+        """Decode a delegate_task tool-result JSON object from stored history."""
+        if isinstance(content, dict):
+            return content
+        if not isinstance(content, str):
+            return None
+        text = content.lstrip()
+        if not text or text.startswith("<persisted-output"):
+            return None
+        try:
+            value, _ = json.JSONDecoder().raw_decode(text)
+        except Exception:
+            return None
+        return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _stored_tool_call_name(tool_call: Any) -> Optional[str]:
+        if not isinstance(tool_call, dict):
+            return None
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            if isinstance(name, str):
+                return name
+        name = tool_call.get("name")
+        return name if isinstance(name, str) else None
+
+    def _rehydrate_delegate_runtime_from_parent_result(self) -> bool:
+        """Restore delegated runtime identity for a continued child session."""
+        if self._delegate_lineage_rehydrated:
+            return bool(self._delegate_resolution)
+        self._delegate_lineage_rehydrated = True
+        if not self._session_db or not self.session_id:
+            return False
+        try:
+            current = self._session_db.get_session(self.session_id)
+        except Exception:
+            logger.debug("delegate lineage rehydration: could not load session", exc_info=True)
+            return False
+        if not isinstance(current, dict):
+            return False
+        parent_session_id = current.get("parent_session_id")
+        if not isinstance(parent_session_id, str) or not parent_session_id:
+            return False
+        self._parent_session_id = parent_session_id
+        try:
+            parent_messages = self._session_db.get_messages(parent_session_id)
+        except Exception:
+            logger.debug("delegate lineage rehydration: could not load parent messages", exc_info=True)
+            return False
+
+        delegate_tool_call_ids = set()
+        for msg in parent_messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tool_call in msg.get("tool_calls") or []:
+                if self._stored_tool_call_name(tool_call) != "delegate_task":
+                    continue
+                tool_call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+                if isinstance(tool_call_id, str) and tool_call_id:
+                    delegate_tool_call_ids.add(tool_call_id)
+
+        for msg in parent_messages or []:
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            tool_call_id = msg.get("tool_call_id")
+            tool_name = msg.get("tool_name")
+            if delegate_tool_call_ids:
+                if tool_call_id not in delegate_tool_call_ids:
+                    continue
+            elif tool_name != "delegate_task":
+                continue
+            payload = self._decode_delegate_tool_result_payload(msg.get("content"))
+            if not payload:
+                continue
+            for entry in payload.get("results") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("child_session_id") != self.session_id:
+                    continue
+                resolution = entry.get("delegate_resolution")
+                if not isinstance(resolution, dict):
+                    continue
+                try:
+                    depth = int(entry.get("delegate_depth") or 1)
+                except (TypeError, ValueError):
+                    depth = 1
+                self._delegate_depth = max(1, depth)
+                try:
+                    self.activate_delegate_runtime(resolution)
+                except Exception:
+                    logger.warning(
+                        "delegate lineage rehydration failed runtime activation for session %s",
+                        self.session_id,
+                        exc_info=True,
+                    )
+                    return False
+                return True
+        return False
+
     def _dispatch_delegate_task(self, function_args: dict) -> str:
         """Single call site for delegate_task dispatch.
 
@@ -3795,6 +3954,17 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            agent=function_args.get("agent"),
+            subagent_type=function_args.get("subagent_type"),
+            category=function_args.get("category"),
+            archetype=function_args.get("archetype"),
+            specialist=function_args.get("specialist"),
+            route_category=function_args.get("route_category"),
+            delegation_profile=function_args.get("delegation_profile"),
+            runtime_mode=function_args.get("runtime_mode"),
+            skills=function_args.get("skills"),
+            task_contract=function_args.get("task_contract"),
+            named_workflow=function_args.get("named_workflow"),
             parent_agent=self,
         )
 

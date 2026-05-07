@@ -251,6 +251,8 @@ def run_conversation(
     # No-op when _fallback_activated is False (gateway, first turn, etc.).
     agent._restore_primary_runtime()
 
+    agent._rehydrate_delegate_runtime_from_parent_result()
+
     # Sanitize surrogate characters from user input.  Clipboard paste from
     # rich-text editors (Google Docs, Word, etc.) can inject lone surrogates
     # that are invalid UTF-8 and crash JSON serialization in the OpenAI SDK.
@@ -574,10 +576,22 @@ def run_conversation(
     # Use original_user_message (clean input) — user_message may contain
     # injected skill content that bloats / breaks provider queries.
     _ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not (agent._cli_filtered_memory_bridge and agent._cli_filtered_memory_bridge.is_enabled()):
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+        except Exception:
+            pass
+    if agent.platform == "cli" and agent._cli_filtered_memory_bridge:
+        try:
+            _query = original_user_message if isinstance(original_user_message, str) else ""
+            _cli_bridge_result = agent._cli_filtered_memory_bridge.prefetch(_query)
+            _cli_bridge_context = getattr(_cli_bridge_result, "context", "") or ""
+            if _cli_bridge_context:
+                _ext_prefetch_cache = (
+                    (_ext_prefetch_cache + "\n\n" + _cli_bridge_context).strip()
+                    if _ext_prefetch_cache else _cli_bridge_context
+                )
         except Exception:
             pass
 

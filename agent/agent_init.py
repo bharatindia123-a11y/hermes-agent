@@ -198,6 +198,12 @@ def init_agent(
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    agent._delegate_resolution: Dict[str, Any] = {}
+    agent._delegate_runtime_mode: Optional[str] = None
+    agent._delegate_named_workflow: Optional[Dict[str, Any]] = None
+    agent._delegate_task_contract: Optional[Dict[str, Any]] = None
+    agent._delegate_required_tools: set[str] = set()
+    agent._delegate_lineage_rehydrated = False
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_name = user_name
@@ -927,6 +933,40 @@ def init_agent(
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
+    mem_config = _agent_cfg.get("memory", {}) if isinstance(_agent_cfg, dict) else {}
+
+    # Narrow CLI-only filtered read bridge. This is deliberately separate
+    # from memory.composite.injection_enabled/tools_enabled: it only returns
+    # per-turn ephemeral context through the existing user-message memory
+    # fence, only for platform="cli", and only when explicitly enabled.
+    agent._cli_filtered_memory_bridge = None
+    try:
+        _composite_cfg_for_bridge = mem_config.get("composite", {}) if isinstance(mem_config, dict) else {}
+        _cli_bridge_cfg = _composite_cfg_for_bridge.get("cli_filtered_read", {}) if isinstance(_composite_cfg_for_bridge, dict) else {}
+        _cli_bridge_enabled = bool(
+            isinstance(_cli_bridge_cfg, dict)
+            and _cli_bridge_cfg.get("enabled", False)
+            and not _composite_cfg_for_bridge.get("tools_enabled", False)
+        )
+        if agent.platform == "cli" and not skip_memory and _cli_bridge_enabled:
+            from agent.cli_filtered_memory_bridge import CliFilteredMemoryBridge
+            agent._cli_filtered_memory_bridge = CliFilteredMemoryBridge(
+                enabled=True,
+                skip_memory=skip_memory,
+                namespace=str(_cli_bridge_cfg.get("namespace") or "hermes-thindi-memory-vnext-staging"),
+                latency_budget_ms=int(_cli_bridge_cfg.get("latency_budget_ms", 2000)),
+                max_blocks=int(_cli_bridge_cfg.get("max_blocks", 2)),
+                honcho_limit=int(_cli_bridge_cfg.get("honcho_limit", 3)),
+                hindsight_max_tokens=int(_cli_bridge_cfg.get("hindsight_max_tokens", 1000)),
+                hindsight_fetch_enabled=bool(_cli_bridge_cfg.get("hindsight_fetch_enabled", False)),
+                hindsight_cache_enabled=bool(_cli_bridge_cfg.get("hindsight_cache_enabled", False)),
+                hindsight_cache_path=_cli_bridge_cfg.get("hindsight_cache_path") or "/root/.hermes/profiles/thindi/workspace/memory-vnext/cache/hindsight-prewarm-cache.json",
+                hindsight_cache_ttl_seconds=int(_cli_bridge_cfg.get("hindsight_cache_ttl_seconds", 300)),
+                harness_path=_cli_bridge_cfg.get("harness_path") or "/root/.hermes/profiles/thindi/workspace/memory-vnext/scripts/filtered_read_harness.py",
+            )
+    except Exception as _cli_bridge_exc:
+        logger.debug("CLI filtered memory bridge init skipped: %s", _cli_bridge_exc)
+        agent._cli_filtered_memory_bridge = None
 
     # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
     agent._memory_store = None
@@ -937,7 +977,6 @@ def init_agent(
     agent._iters_since_skill = 0
     if not skip_memory:
         try:
-            mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
@@ -983,6 +1022,12 @@ def init_agent(
                                 _init_kwargs["session_title"] = _st
                         except Exception:
                             pass
+                    # Thread provider-specific runtime config. Composite needs this because
+                    # live YAML can only name children, not inject Python provider objects.
+                    if _mem_provider_name == "composite" and isinstance(mem_config, dict):
+                        _composite_cfg = mem_config.get("composite")
+                        if isinstance(_composite_cfg, dict):
+                            _init_kwargs["composite_config"] = _composite_cfg
                     # Thread gateway user identity for per-user memory scoping
                     if agent._user_id:
                         _init_kwargs["user_id"] = agent._user_id

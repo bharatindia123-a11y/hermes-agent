@@ -39,6 +39,14 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+from agent.archetypes import get_tool_restrictions, resolve_archetype, resolve_archetype_defaults, resolve_specialist_mapping
+from agent.route_categories import DEFAULT_LITERAL_CATEGORY, DEFAULT_ROUTE_CATEGORY, resolve_literal_category, resolve_route_category
+from agent.runtime_modes import DEFAULT_RUNTIME_MODE_NAME, resolve_runtime_mode
+from agent.task_contracts import (
+    build_named_workflow_artifact,
+    validate_named_workflow_artifact,
+    validate_task_contract,
+)
 
 
 # Tools that children must never have access to
@@ -134,7 +142,7 @@ MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); grandchild rejected u
 # Configurable depth cap consulted by _get_max_spawn_depth; MAX_DEPTH
 # stays as the default fallback and is still the symbol tests import.
 _MIN_SPAWN_DEPTH = 1
-_MAX_SPAWN_DEPTH_CAP = 3
+_MAX_SPAWN_DEPTH_CAP = 12
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +533,386 @@ DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
 # ---------------------------------------------------------------------------
+# OMO Wave 2 resolver helpers (schema/runtime metadata only; no background).
+# ---------------------------------------------------------------------------
+
+_MUTATING_TOOL_NAMES = frozenset({
+    "write_file", "patch", "terminal", "execute_code", "delegate_task", "task", "memory", "send_message", "clarify"
+})
+
+_DEFAULT_ABILITY_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "oracle": {
+        "agent": "oracle",
+        "aliases": ["consultant"],
+        "specialist": "consultant",
+        "archetype": "verifier",
+        "route_category": "deep",
+        "delegation_profile": "verification",
+        "runtime_mode": "default",
+        "blocked_tools": sorted(_MUTATING_TOOL_NAMES),
+    },
+    "librarian": {
+        "agent": "librarian",
+        "specialist": "librarian",
+        "archetype": "researcher",
+        "route_category": "deep",
+        "delegation_profile": "research",
+        "runtime_mode": "default",
+        "blocked_tools": sorted(_MUTATING_TOOL_NAMES),
+    },
+    "explore": {
+        "agent": "explore",
+        "aliases": ["explorer"],
+        "specialist": "explorer",
+        "archetype": "researcher",
+        "route_category": "quick",
+        "delegation_profile": "research",
+        "runtime_mode": "default",
+        "blocked_tools": sorted(_MUTATING_TOOL_NAMES),
+    },
+    "momus": {
+        "agent": "momus",
+        "specialist": "momus",
+        "archetype": "verifier",
+        "route_category": "deep",
+        "delegation_profile": "verification",
+        "runtime_mode": "default",
+        "blocked_tools": sorted(_MUTATING_TOOL_NAMES),
+    },
+    "atlas": {
+        "agent": "atlas",
+        "specialist": "builder",
+        "archetype": "implementer",
+        "route_category": "deep",
+        "delegation_profile": "implementation",
+        "runtime_mode": "execution_supervisor",
+        "blocked_tools": ["delegate_task", "task"],
+    },
+    "multimodal-looker": {
+        "agent": "multimodal-looker",
+        "aliases": ["multimodal_looker", "looker", "multimodal"],
+        "specialist": "looker",
+        "archetype": "researcher",
+        "route_category": "visual",
+        "delegation_profile": "research",
+        "runtime_mode": "default",
+        "allowed_tools": ["read_file", "search_files", "vision_analyze", "browser_vision", "browser_snapshot", "browser_get_images", "browser_console"],
+    },
+    "hephaestus": {
+        "agent": "hephaestus",
+        "specialist": "builder",
+        "archetype": "implementer",
+        "route_category": "deep",
+        "delegation_profile": "implementation",
+        "runtime_mode": "default",
+    },
+    "prometheus": {
+        "agent": "prometheus",
+        "specialist": "planner",
+        "archetype": "generalist",
+        "route_category": "deep",
+        "delegation_profile": "planning",
+        "runtime_mode": "interview_planning",
+    },
+}
+
+
+def _canonicalize_named_agent_lookup_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def _normalize_named_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    out: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in seen:
+            out.append(text)
+            seen.add(text)
+    return out
+
+
+def _load_full_config() -> dict:
+    try:
+        from cli import CLI_CONFIG
+        if CLI_CONFIG:
+            return dict(CLI_CONFIG)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        return load_config() or {}
+    except Exception:
+        return {}
+
+
+def _normalize_delegation_config(cfg: Optional[dict]) -> dict:
+    raw = dict(cfg or {})
+    raw.setdefault("profiles", {})
+    raw.setdefault("categories", {})
+    return raw
+
+
+def _resolve_named_agent_config(name: Any, full_config: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+    key = _canonicalize_named_agent_lookup_key(name)
+    if not key:
+        return None
+    registry: Dict[str, Dict[str, Any]] = {k: dict(v) for k, v in _DEFAULT_ABILITY_CONFIGS.items()}
+    for raw_name, raw_cfg in dict((full_config or {}).get("agents") or {}).items():
+        cfg = dict(raw_cfg or {})
+        canonical = _canonicalize_named_agent_lookup_key(cfg.get("agent") or cfg.get("name") or raw_name)
+        if not canonical:
+            continue
+        cfg.setdefault("agent", canonical)
+        registry[canonical] = cfg
+    alias_map: Dict[str, str] = {}
+    for canonical, cfg in registry.items():
+        alias_map[canonical] = canonical
+        for alias in _normalize_named_string_list(cfg.get("aliases")):
+            alias_map[_canonicalize_named_agent_lookup_key(alias)] = canonical
+    canonical = alias_map.get(key)
+    if not canonical:
+        return None
+    cfg = dict(registry[canonical])
+    cfg["agent"] = canonical
+    cfg["named_agent"] = canonical
+    if cfg.get("enabled") is False:
+        raise ValueError(f"Named agent '{canonical}' is disabled")
+    return cfg
+
+
+def _resolve_route_category_entry(route_category: Any = None, *, literal_category: Any = None, config: Optional[dict] = None) -> Dict[str, Any]:
+    if route_category:
+        resolved = resolve_route_category(str(route_category))
+        if resolved.name == DEFAULT_ROUTE_CATEGORY and str(route_category).strip() not in {"", DEFAULT_ROUTE_CATEGORY}:
+            raise ValueError(f"Unknown route_category: {route_category}")
+    elif literal_category:
+        resolved = resolve_literal_category(str(literal_category))
+        resolved = resolve_route_category(resolved.route_category)
+    else:
+        resolved = resolve_route_category(None)
+    overrides = dict((config or {}).get("route_categories") or {}).get(resolved.name) or {}
+    return {
+        "name": resolved.name,
+        "summary": str(overrides.get("summary") or resolved.summary),
+        "intensity": str(overrides.get("intensity") or resolved.intensity),
+        "fallback_models": list(overrides.get("fallback_models") or resolved.fallback_models),
+    }
+
+
+def _resolve_runtime_mode_entry(runtime_mode: Any = None, *, config: Optional[dict] = None) -> Dict[str, Any]:
+    resolved = resolve_runtime_mode(str(runtime_mode) if runtime_mode is not None else None)
+    if runtime_mode and resolved.name == DEFAULT_RUNTIME_MODE_NAME and str(runtime_mode).strip().lower() not in {"", DEFAULT_RUNTIME_MODE_NAME}:
+        raise ValueError(f"Unknown runtime_mode: {runtime_mode}")
+    overrides = dict((config or {}).get("runtime_modes") or {}).get(resolved.name) or {}
+    return {
+        "name": resolved.name,
+        "description": str(overrides.get("description") or resolved.description),
+        "operating_posture": str(overrides.get("operating_posture") or resolved.operating_posture),
+        "iteration_cap": int(overrides.get("iteration_cap") or resolved.iteration_cap),
+    }
+
+
+def _resolve_task_delegation_profile_details(*, delegation_profile: Any = None, category: Any = None, config: Optional[dict] = None) -> Dict[str, Any]:
+    profile = str(delegation_profile or category or "general").strip() or "general"
+    compatibility_only = bool(category and not delegation_profile)
+    source = "delegation_profile" if delegation_profile else ("category" if category else "default")
+    profiles = dict((config or {}).get("profiles") or {}) | dict((config or {}).get("categories") or {})
+    details = dict(profiles.get(profile) or {})
+    details.setdefault("name", profile)
+    details["source"] = source
+    details["compatibility_only"] = compatibility_only
+    return details
+
+
+def _normalize_task_contract(payload: Any, *, goal: str = "") -> Optional[dict]:
+    if payload is None:
+        return None
+    try:
+        return validate_task_contract(payload).model_dump()
+    except Exception as exc:
+        label = f" for delegated task {goal!r}" if goal else ""
+        raise ValueError(f"Invalid task_contract{label}: {exc}") from exc
+
+
+def _normalize_named_workflow_artifact(payload: Any, *, goal: str = "") -> Optional[dict]:
+    if payload is None:
+        return None
+    try:
+        return validate_named_workflow_artifact(payload).model_dump(by_alias=True)
+    except Exception as exc:
+        label = f" for delegated task {goal!r}" if goal else ""
+        raise ValueError(f"Invalid named_workflow{label}: {exc}") from exc
+
+
+def _build_named_workflow_prompt_block(named_workflow: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(named_workflow, dict):
+        return ""
+    workflow_name = named_workflow.get("workflow_name") or named_workflow.get("name") or "unknown"
+    payload = json.dumps(named_workflow, sort_keys=True, ensure_ascii=False, indent=2)
+    return "\n".join([
+        f"Named workflow activated: {workflow_name}",
+        "<named-workflow>",
+        payload,
+        "</named-workflow>",
+    ])
+
+
+def _build_omo_overlay_prompt(resolution: Dict[str, Any]) -> str:
+    compact = {k: v for k, v in resolution.items() if k not in {"overlay_prompt", "route_category_definition", "runtime_mode_definition"}}
+    parts = [
+        "## OMO / Named-Agent Runtime Contract",
+        "This delegated child is running with a structured Hermes ability contract. Profiles remain hosting boundaries, not agent identities.",
+        "```json",
+        json.dumps(compact, sort_keys=True, ensure_ascii=False, indent=2),
+        "```",
+    ]
+    named_workflow_block = _build_named_workflow_prompt_block(compact.get("named_workflow"))
+    if named_workflow_block:
+        parts.extend(["", named_workflow_block])
+    return "\n".join(parts)
+
+
+def _resolve_task_inputs(task: Dict[str, Any], *, top_level: Optional[Dict[str, Any]] = None, full_config: Optional[dict] = None, delegation_config: Optional[dict] = None) -> Dict[str, Any]:
+    top = dict(top_level or {})
+    explicit_route_input = task.get("route_category") if task.get("route_category") is not None else top.get("route_category")
+    merged = {**top, **{k: v for k, v in task.items() if v is not None}}
+    agent_name = merged.get("agent") or merged.get("subagent_type")
+    named_cfg = _resolve_named_agent_config(agent_name, full_config) if agent_name else None
+    if agent_name and named_cfg is None:
+        raise ValueError(f"Unknown named agent: {agent_name}")
+    if named_cfg:
+        defaults = {k: v for k, v in named_cfg.items() if k not in {"aliases"}}
+        merged = {**defaults, **merged, "agent": named_cfg["agent"], "named_agent": named_cfg["agent"]}
+    specialist_mapping = resolve_specialist_mapping(merged.get("specialist") or (named_cfg or {}).get("specialist"))
+    specialist = specialist_mapping.name if specialist_mapping else (str(merged.get("specialist")).strip() if merged.get("specialist") else None)
+    explicit_archetype = merged.get("archetype")
+    archetype = resolve_archetype(explicit_archetype or (specialist_mapping.archetype_name if specialist_mapping else None) or merged.get("archetype")).name
+    archetype_defaults = resolve_archetype_defaults(archetype)
+    explicit_category = merged.get("category") or merged.get("literal_category")
+    literal_category = resolve_literal_category(explicit_category or DEFAULT_LITERAL_CATEGORY)
+    if explicit_category and literal_category.name == DEFAULT_LITERAL_CATEGORY:
+        configured_profiles = set(dict((delegation_config or {}).get("profiles") or {})) | set(dict((delegation_config or {}).get("categories") or {}))
+        if str(explicit_category).strip() not in configured_profiles and str(explicit_category).strip() != DEFAULT_LITERAL_CATEGORY:
+            raise ValueError(f"Unknown category: {explicit_category}")
+    route_source = explicit_route_input
+    if not route_source and explicit_category:
+        route_source = getattr(literal_category, "route_category", None)
+    route_entry = _resolve_route_category_entry(route_source or merged.get("route_category") or archetype_defaults.get("default_route_category"), literal_category=literal_category.name, config=delegation_config)
+    runtime_entry = _resolve_runtime_mode_entry(merged.get("runtime_mode") or (named_cfg or {}).get("runtime_mode"), config=delegation_config)
+    profile_details = _resolve_task_delegation_profile_details(delegation_profile=merged.get("delegation_profile") or archetype_defaults.get("default_delegation_profile"), category=merged.get("category"), config=delegation_config)
+    skills = []
+    for part in (archetype_defaults.get("default_skills"), (named_cfg or {}).get("skills"), top.get("skills"), task.get("skills")):
+        for skill in _normalize_named_string_list(part):
+            if skill not in skills:
+                skills.append(skill)
+    goal_text = str(task.get("goal") or merged.get("goal") or "")
+    named_workflow = _normalize_named_workflow_artifact(merged.get("named_workflow"), goal=goal_text)
+    raw_task_contract = merged.get("task_contract")
+    if raw_task_contract is None and isinstance(named_workflow, dict):
+        raw_task_contract = named_workflow.get("execution_task_contract")
+    task_contract = _normalize_task_contract(raw_task_contract, goal=goal_text)
+    if named_workflow is None:
+        named_workflow = build_named_workflow_artifact(
+            objective=goal_text,
+            specialist=specialist_mapping.name if specialist_mapping else None,
+            archetype=archetype,
+            route_category=route_entry["name"],
+            runtime_mode=runtime_entry["name"],
+            delegation_profile=profile_details["name"],
+            task_contract=task_contract,
+        )
+        if task_contract is None and isinstance(named_workflow, dict):
+            task_contract = _normalize_task_contract(named_workflow.get("execution_task_contract"), goal=goal_text)
+
+    resolution = {
+        "agent": merged.get("agent"),
+        "named_agent": merged.get("named_agent") or merged.get("agent"),
+        "specialist": specialist,
+        "archetype": archetype,
+        "category": literal_category.name,
+        "literal_category": literal_category.name,
+        "route_category": route_entry["name"],
+        "route_category_definition": route_entry,
+        "delegation_profile": profile_details["name"],
+        "delegation_profile_source": profile_details["source"],
+        "delegation_profile_compatibility_only": profile_details["compatibility_only"],
+        "legacy_category_input": merged.get("category"),
+        "runtime_mode": runtime_entry["name"],
+        "runtime_mode_definition": runtime_entry,
+        "skills": skills,
+        "task_contract": task_contract,
+        "named_workflow": named_workflow,
+    }
+    resolution["overlay_prompt"] = _build_omo_overlay_prompt(resolution)
+    blocked = set(_normalize_named_string_list((named_cfg or {}).get("blocked_tools")))
+    allowed = set(_normalize_named_string_list((named_cfg or {}).get("allowed_tools")))
+    resolution["blocked_tools"] = sorted(blocked)
+    resolution["allowed_tools"] = sorted(allowed)
+    required_tools = set((task_contract or {}).get("required_tools") or [])
+    role_blocked, role_allowed = get_tool_restrictions(archetype, specialist)
+    blocked_for_contract = set(blocked) | set(role_blocked)
+    allowed_for_contract = set(allowed) or set(role_allowed)
+    profile_enabled_raw = profile_details.get("enabled_tools") if "enabled_tools" in profile_details else profile_details.get("tools")
+    if profile_enabled_raw is not None:
+        profile_enabled_tools = set(_normalize_named_string_list(profile_enabled_raw))
+        if not required_tools.issubset(profile_enabled_tools):
+            disallowed = sorted(required_tools - profile_enabled_tools)
+            if disallowed:
+                raise ValueError(f"task_contract.required_tools not enabled by delegation_profile {profile_details['name']}: {disallowed}")
+    if allowed_for_contract and not required_tools.issubset(allowed_for_contract):
+        disallowed = sorted(required_tools - allowed_for_contract)
+        if disallowed:
+            raise ValueError(f"task_contract.required_tools not allowed for {resolution.get('named_agent') or specialist or archetype}: {disallowed}")
+    mutating_required = sorted(required_tools & (blocked_for_contract | _MUTATING_TOOL_NAMES))
+    if (archetype == "verifier" or specialist in {"consultant", "librarian", "explorer", "momus", "looker"}) and mutating_required:
+        raise ValueError(f"task_contract.required_tools contains tools blocked by read-only policy: {mutating_required}")
+    return resolution
+
+
+def _apply_specialist_tool_restrictions(child, *, delegate_resolution: Optional[Dict[str, Any]] = None, task: Optional[Dict[str, Any]] = None, parent_agent=None):
+    resolution = delegate_resolution or {}
+    blocked, allowed = get_tool_restrictions(resolution.get("archetype"), resolution.get("specialist"))
+    blocked_set = set(blocked) | set(resolution.get("blocked_tools") or [])
+    allowed_set = set(allowed) or set(resolution.get("allowed_tools") or [])
+    if not blocked_set and not allowed_set:
+        return child
+    filtered = []
+    for tool in list(getattr(child, "tools", []) or []):
+        if isinstance(tool, dict):
+            name = ((tool.get("function") or {}).get("name") or tool.get("name"))
+        else:
+            name = getattr(tool, "name", None)
+        if not name:
+            filtered.append(tool)
+            continue
+        if name in blocked_set:
+            continue
+        if allowed_set and name not in allowed_set:
+            continue
+        filtered.append(tool)
+    child.tools = filtered
+    names: List[str] = []
+    for tool in filtered:
+        if isinstance(tool, dict):
+            name = ((tool.get("function") or {}).get("name") or tool.get("name"))
+        else:
+            name = getattr(tool, "name", None)
+        if name:
+            names.append(name)
+    child.valid_tool_names = set(names)
+    return child
+
+
+# ---------------------------------------------------------------------------
 # Delegation progress event types
 # ---------------------------------------------------------------------------
 
@@ -574,6 +962,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    wave1_overlay_prompt: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -596,6 +985,8 @@ def _build_child_system_prompt(
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
         )
+    if wave1_overlay_prompt and str(wave1_overlay_prompt).strip():
+        parts.append("\nWAVE 1 DELEGATION INPUTS:\n" + str(wave1_overlay_prompt).strip())
     parts.append(
         "\nComplete this task using the tools available to you. "
         "When finished, provide a clear, concise summary of:\n"
@@ -888,6 +1279,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    enabled_tools: Optional[List[str]] = None,
+    task: Optional[Dict[str, Any]] = None,
+    wave1_overlay_prompt: Optional[str] = None,
+    delegate_resolution: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -975,6 +1370,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        wave1_overlay_prompt=wave1_overlay_prompt,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1146,6 +1542,27 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_resolution = dict(delegate_resolution or {})
+    if enabled_tools is not None:
+        allowed_names = set(_normalize_named_string_list(enabled_tools))
+        filtered_tools = []
+        for tool in list(getattr(child, "tools", []) or []):
+            if isinstance(tool, dict):
+                name = ((tool.get("function") or {}).get("name") or tool.get("name"))
+            else:
+                name = getattr(tool, "name", None)
+            if name in allowed_names:
+                filtered_tools.append(tool)
+        child.tools = filtered_tools
+        child.valid_tool_names = allowed_names
+    _apply_specialist_tool_restrictions(
+        child,
+        delegate_resolution=delegate_resolution,
+        task=task,
+        parent_agent=parent_agent,
+    )
+    if hasattr(child, "activate_delegate_runtime"):
+        child.activate_delegate_runtime(delegate_resolution)
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -1316,6 +1733,32 @@ def _dump_subagent_timeout_diagnostic(
     except Exception as exc:
         logger.warning("Subagent timeout diagnostic dump failed: %s", exc)
         return None
+
+
+def _json_safe_delegate_resolution(value: Any) -> Dict[str, Any]:
+    """Return a JSON-safe delegate resolution snapshot for lineage replay."""
+    if not isinstance(value, dict):
+        return {}
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+    except Exception:
+        return {str(k): str(v) for k, v in value.items()}
+
+
+def _delegate_child_lineage_fields(child) -> Dict[str, Any]:
+    """Public lineage fields returned to the parent for child-session replay."""
+    fields: Dict[str, Any] = {}
+    child_session_id = getattr(child, "session_id", None)
+    if isinstance(child_session_id, str) and child_session_id:
+        fields["child_session_id"] = child_session_id
+    try:
+        fields["delegate_depth"] = int(getattr(child, "_delegate_depth", 0) or 0)
+    except (TypeError, ValueError):
+        fields["delegate_depth"] = 0
+    fields["delegate_resolution"] = _json_safe_delegate_resolution(
+        getattr(child, "_delegate_resolution", None)
+    )
+    return fields
 
 
 def _run_single_child(
@@ -1600,6 +2043,7 @@ def _run_single_child(
                 "exit_reason": "timeout" if is_timeout else "error",
                 "api_calls": child_api_calls,
                 "duration_seconds": duration,
+                **_delegate_child_lineage_fields(child),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
@@ -1698,6 +2142,7 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            **_delegate_child_lineage_fields(child),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -1836,6 +2281,7 @@ def _run_single_child(
             "error": str(exc),
             "api_calls": 0,
             "duration_seconds": duration,
+            **_delegate_child_lineage_fields(child),
             "_child_role": getattr(child, "_delegate_role", None),
         }
 
@@ -1924,6 +2370,17 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    agent: Optional[str] = None,
+    subagent_type: Optional[str] = None,
+    category: Optional[str] = None,
+    archetype: Optional[str] = None,
+    specialist: Optional[str] = None,
+    route_category: Optional[str] = None,
+    delegation_profile: Optional[str] = None,
+    runtime_mode: Optional[str] = None,
+    skills: Optional[List[str]] = None,
+    task_contract: Optional[Dict[str, Any]] = None,
+    named_workflow: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1972,6 +2429,7 @@ def delegate_task(
         )
 
     # Load config
+    full_cfg = _load_full_config()
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
@@ -2017,7 +2475,23 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "agent": agent,
+                "subagent_type": subagent_type,
+                "category": category,
+                "archetype": archetype,
+                "specialist": specialist,
+                "route_category": route_category,
+                "delegation_profile": delegation_profile,
+                "runtime_mode": runtime_mode,
+                "skills": skills,
+                "task_contract": task_contract,
+                "named_workflow": named_workflow,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -2058,11 +2532,44 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            inherited_named_workflow = named_workflow
+            if inherited_named_workflow is None and parent_agent is not None:
+                parent_named_workflow = getattr(parent_agent, "_delegate_named_workflow", None)
+                inherited_named_workflow = parent_named_workflow if isinstance(parent_named_workflow, dict) else None
+            top_inputs = {
+                "agent": agent,
+                "subagent_type": subagent_type,
+                "category": category,
+                "archetype": archetype,
+                "specialist": specialist,
+                "route_category": route_category,
+                "delegation_profile": delegation_profile,
+                "runtime_mode": runtime_mode,
+                "skills": skills,
+                "task_contract": task_contract,
+                "named_workflow": inherited_named_workflow,
+            }
+            try:
+                delegate_resolution = _resolve_task_inputs(
+                    t,
+                    top_level=top_inputs,
+                    full_config=full_cfg,
+                    delegation_config=cfg,
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
+            profile_details = _resolve_task_delegation_profile_details(
+                delegation_profile=delegate_resolution.get("delegation_profile"),
+                category=t.get("category"),
+                config=cfg,
+            )
+            profile_toolsets = profile_details.get("toolsets") or profile_details.get("enabled_toolsets")
+            profile_enabled_tools = profile_details.get("enabled_tools") if "enabled_tools" in profile_details else profile_details.get("tools")
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                toolsets=t.get("toolsets") or toolsets,
+                toolsets=t.get("toolsets") or profile_toolsets or toolsets,
                 model=creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
@@ -2080,6 +2587,10 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                enabled_tools=profile_enabled_tools,
+                task=t,
+                wave1_overlay_prompt=delegate_resolution.get("overlay_prompt"),
+                delegate_resolution=delegate_resolution,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2138,6 +2649,7 @@ def delegate_task(
                                     "error": str(exc),
                                     "api_calls": 0,
                                     "duration_seconds": 0,
+                                    **_delegate_child_lineage_fields(_child_by_index.get(idx)),
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
@@ -2150,6 +2662,7 @@ def delegate_task(
                                 "error": "Parent agent interrupted — child did not finish in time",
                                 "api_calls": 0,
                                 "duration_seconds": 0,
+                                **_delegate_child_lineage_fields(_child_by_index.get(idx)),
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
                                 ),
@@ -2175,6 +2688,7 @@ def delegate_task(
                             "error": str(exc),
                             "api_calls": 0,
                             "duration_seconds": 0,
+                            **_delegate_child_lineage_fields(_child_by_index.get(idx)),
                             "_child_role": getattr(
                                 _child_by_index.get(idx), "_delegate_role", None
                             ),
@@ -2777,6 +3291,25 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
+# Bucket B OMO schema/pass-through extension. Kept as post-literal mutation so the
+# upstream v2026.4.30 delegate schema stays reviewable and hardening stays intact.
+_OMO_DELEGATE_SCHEMA_PROPERTIES = {
+    "agent": {"type": "string", "description": "Named Hermes ability/agent preset, e.g. oracle, librarian, explore, hephaestus."},
+    "subagent_type": {"type": "string", "description": "OMO/Claude-compatible alias for agent. Used only when agent is absent."},
+    "category": {"type": "string", "description": "Legacy/OMO literal category or compatibility delegation-profile alias."},
+    "archetype": {"type": "string", "description": "Internal capability family, e.g. generalist, researcher, implementer, verifier."},
+    "specialist": {"type": "string", "description": "Specialist overlay, e.g. planner, reviewer, consultant, looker."},
+    "route_category": {"type": "string", "description": "Internal routing lane, kept separate from literal category and delegation profile."},
+    "delegation_profile": {"type": "string", "description": "Execution policy bundle, kept separate from category and runtime mode."},
+    "runtime_mode": {"type": "string", "description": "Runtime posture such as default, interview_planning, execution_supervisor, ultrawork."},
+    "skills": {"type": "array", "items": {"type": "string"}, "description": "Skills to load/inject for the child ability."},
+    "task_contract": {"type": "object", "description": "Machine-readable task contract for the delegated child."},
+    "named_workflow": {"type": "object", "description": "Canonical named-workflow runtime artifact. If task_contract is absent, execution_task_contract may supply it."},
+}
+DELEGATE_TASK_SCHEMA["parameters"]["properties"].update(_OMO_DELEGATE_SCHEMA_PROPERTIES)
+DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]["items"]["properties"].update(_OMO_DELEGATE_SCHEMA_PROPERTIES)
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
 
@@ -2793,6 +3326,17 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        agent=args.get("agent"),
+        subagent_type=args.get("subagent_type"),
+        category=args.get("category"),
+        archetype=args.get("archetype"),
+        specialist=args.get("specialist"),
+        route_category=args.get("route_category"),
+        delegation_profile=args.get("delegation_profile"),
+        runtime_mode=args.get("runtime_mode"),
+        skills=args.get("skills"),
+        task_contract=args.get("task_contract"),
+        named_workflow=args.get("named_workflow"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
