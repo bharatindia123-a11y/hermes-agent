@@ -49,6 +49,11 @@ def _child_enabled_for(value: Any, default: bool = True) -> bool:
     return _as_bool(value, default)
 
 
+def _child_read_enabled(child_cfg: Dict[str, Any]) -> bool:
+    """Return whether a child may participate in read/recall flows."""
+    return _child_enabled_for(child_cfg.get("read"), True)
+
+
 def _normalize_child_configs(children: Any) -> List[Dict[str, Any]]:
     """Accept the Wave 3 dict-keyed config shape while preserving test-injected list specs.
 
@@ -227,6 +232,8 @@ class CompositeMemoryProvider(MemoryProvider):
 
         parts = []
         for child in self._children:
+            if not _child_read_enabled(child.get("config", {})):
+                continue
             try:
                 result = child["provider"].prefetch(query, session_id=session_id)
             except Exception as exc:
@@ -239,6 +246,22 @@ class CompositeMemoryProvider(MemoryProvider):
             if result and str(result).strip():
                 parts.append(str(result))
         return "\n\n".join(parts)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        if not self._injection_enabled:
+            return
+
+        for child in self._children:
+            if not _child_read_enabled(child.get("config", {})):
+                continue
+            try:
+                child["provider"].queue_prefetch(query, session_id=session_id)
+            except Exception as exc:
+                logger.debug(
+                    "Composite child '%s' queue_prefetch failed (non-fatal): %s",
+                    child["name"],
+                    exc,
+                )
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         for child in self._children:

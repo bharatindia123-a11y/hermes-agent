@@ -29,6 +29,7 @@ class FakeChildProvider(MemoryProvider):
         self.initialize_calls = []
         self.sync_calls = []
         self.prefetch_calls = []
+        self.queue_prefetch_calls = []
         self.tool_calls = []
 
     @property
@@ -46,6 +47,9 @@ class FakeChildProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         self.prefetch_calls.append({"query": query, "session_id": session_id})
         return self._context
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        self.queue_prefetch_calls.append({"query": query, "session_id": session_id})
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         self.sync_calls.append(
@@ -319,6 +323,30 @@ def test_sync_turn_skips_children_with_write_disabled():
     assert hindsight.sync_calls == []
     assert len(honcho.sync_calls) == 1
     assert honcho.sync_calls[0]["session_id"] == "session-write-gate"
+
+
+def test_read_disabled_skips_prefetch_and_queue_prefetch():
+    disabled = FakeChildProvider("disabled", context="hidden")
+    enabled = FakeChildProvider("enabled", context="visible")
+    provider = CompositeMemoryProvider(
+        config={
+            "injection_enabled": True,
+            "children": {
+                "disabled": {"enabled": True, "read": False, "provider_class": FakeChildFactory(disabled)},
+                "enabled": {"enabled": True, "read": True, "provider_class": FakeChildFactory(enabled)},
+            },
+        }
+    )
+
+    provider.initialize("session-read-gate", platform="cli")
+    provider.queue_prefetch("hello", session_id="session-read-gate")
+    result = provider.prefetch("hello", session_id="session-read-gate")
+
+    assert result == "visible"
+    assert disabled.queue_prefetch_calls == []
+    assert disabled.prefetch_calls == []
+    assert enabled.queue_prefetch_calls == [{"query": "hello", "session_id": "session-read-gate"}]
+    assert enabled.prefetch_calls == [{"query": "hello", "session_id": "session-read-gate"}]
 
 
 def test_config_schema_documents_wave3_dict_shape_and_safety_defaults():
