@@ -2758,8 +2758,20 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
+            effective_prompt = ephemeral_system_prompt
+            try:
+                from hermes_cli.config import load_config
+                from hermes_cli.default_mode import append_ultrawork_prompt, default_mode_config
+
+                _cfg = load_config() or {}
+                _default_mode = default_mode_config(_cfg)
+                if _default_mode.get("ultrawork"):
+                    effective_prompt = append_ultrawork_prompt(effective_prompt)
+            except Exception:
+                _default_mode = {"ultrawork": False, "ralph_loop": False}
+
             agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
+                ephemeral_system_prompt=effective_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
@@ -2770,11 +2782,49 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_ref is not None:
                 agent_ref[0] = agent
             effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
+
+            goal_mgr = None
+            if _default_mode.get("ralph_loop") and session_id and str(user_message or "").strip():
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    _goals_cfg = (_cfg.get("goals") if isinstance(_cfg, dict) else {}) or {}
+                    try:
+                        _max_turns = int(_goals_cfg.get("max_turns", 20) or 20)
+                    except Exception:
+                        _max_turns = 20
+                    goal_mgr = GoalManager(session_id=session_id, default_max_turns=_max_turns)
+                    if not goal_mgr.has_goal():
+                        goal_mgr.set(str(user_message))
+                except Exception as exc:
+                    logger.debug("default_mode ralph_loop API activation failed: %s", exc)
+                    goal_mgr = None
+
+            current_message = user_message
+            current_history = conversation_history
+            result = {}
+            while True:
+                result = agent.run_conversation(
+                    user_message=current_message,
+                    conversation_history=current_history,
+                    task_id=effective_task_id,
+                )
+                if not goal_mgr or not goal_mgr.is_active():
+                    break
+                final_response = ""
+                if isinstance(result, dict):
+                    final_response = str(result.get("final_response") or "")
+                if not final_response.strip() or (isinstance(result, dict) and result.get("failed")):
+                    break
+                decision = goal_mgr.evaluate_after_turn(final_response, user_initiated=True)
+                if not decision.get("should_continue"):
+                    break
+                continuation = decision.get("continuation_prompt")
+                if not continuation:
+                    break
+                current_message = continuation
+                current_history = getattr(agent, "conversation_history", None) or result.get("messages") or current_history
+
             usage = {
                 "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -2975,8 +3025,21 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
+                effective_system_prompt = ephemeral_system_prompt
+                try:
+                    from hermes_cli.config import load_config
+                    from hermes_cli.default_mode import append_ultrawork_prompt, default_mode_config
+
+                    _runs_cfg = load_config() or {}
+                    _runs_default_mode = default_mode_config(_runs_cfg)
+                    if _runs_default_mode.get("ultrawork"):
+                        effective_system_prompt = append_ultrawork_prompt(effective_system_prompt)
+                except Exception:
+                    _runs_cfg = {}
+                    _runs_default_mode = {"ultrawork": False, "ralph_loop": False}
+
                 agent = self._create_agent(
-                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    ephemeral_system_prompt=effective_system_prompt,
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
@@ -3024,11 +3087,45 @@ class APIServerAdapter(BasePlatformAdapter):
                             session_key=approval_session_key,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
-                        r = agent.run_conversation(
-                            user_message=user_message,
-                            conversation_history=conversation_history,
-                            task_id=effective_task_id,
-                        )
+                        goal_mgr = None
+                        if _runs_default_mode.get("ralph_loop") and session_id and str(user_message or "").strip():
+                            try:
+                                from hermes_cli.goals import GoalManager
+
+                                _goals_cfg = (_runs_cfg.get("goals") if isinstance(_runs_cfg, dict) else {}) or {}
+                                try:
+                                    _max_turns = int(_goals_cfg.get("max_turns", 20) or 20)
+                                except Exception:
+                                    _max_turns = 20
+                                goal_mgr = GoalManager(session_id=session_id, default_max_turns=_max_turns)
+                                if not goal_mgr.has_goal():
+                                    goal_mgr.set(str(user_message))
+                            except Exception as exc:
+                                logger.debug("default_mode ralph_loop /v1/runs activation failed: %s", exc)
+                                goal_mgr = None
+
+                        current_message = user_message
+                        current_history = conversation_history
+                        r = {}
+                        while True:
+                            r = agent.run_conversation(
+                                user_message=current_message,
+                                conversation_history=current_history,
+                                task_id=effective_task_id,
+                            )
+                            if not goal_mgr or not goal_mgr.is_active():
+                                break
+                            final_response = str(r.get("final_response") or "") if isinstance(r, dict) else ""
+                            if not final_response.strip() or (isinstance(r, dict) and r.get("failed")):
+                                break
+                            decision = goal_mgr.evaluate_after_turn(final_response, user_initiated=True)
+                            if not decision.get("should_continue"):
+                                break
+                            continuation = decision.get("continuation_prompt")
+                            if not continuation:
+                                break
+                            current_message = continuation
+                            current_history = getattr(agent, "conversation_history", None) or r.get("messages") or current_history
                     finally:
                         try:
                             unregister_gateway_notify(approval_session_key)

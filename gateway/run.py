@@ -7904,6 +7904,44 @@ class GatewayRunner:
         if message_text is None:
             return
 
+        # OMO v4.3 default_mode: activate only for normal top-level gateway
+        # messages. Goal continuations are synthetic events and must not
+        # recursively start new goals; explicit /goal handling remains the
+        # user escape hatch.
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.default_mode import (
+                append_ultrawork_prompt,
+                is_default_ralph_loop_enabled,
+                is_default_ultrawork_enabled,
+            )
+
+            _default_cfg = load_config() or {}
+            if is_default_ultrawork_enabled(_default_cfg):
+                context_prompt = append_ultrawork_prompt(context_prompt)
+            if (
+                is_default_ralph_loop_enabled(_default_cfg)
+                and message_text.strip()
+                and not self._is_goal_continuation_event(event)
+            ):
+                try:
+                    from hermes_cli.goals import GoalManager
+
+                    _mgr = GoalManager(
+                        session_id=session_entry.session_id,
+                        default_max_turns=self._goal_max_turns_from_config(),
+                    )
+                    if not _mgr.has_goal():
+                        _mgr.set(message_text)
+                        logger.info(
+                            "default_mode.ralph_loop started goal for gateway session %s",
+                            session_entry.session_id,
+                        )
+                except Exception as _goal_exc:
+                    logger.debug("default_mode ralph_loop activation failed: %s", _goal_exc)
+        except Exception as _default_exc:
+            logger.debug("default_mode gateway activation failed: %s", _default_exc)
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.

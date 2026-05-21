@@ -8698,6 +8698,44 @@ class HermesCLI:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         _cprint(f"  ✓ Added subgoal {idx}: {text}")
 
+    def _maybe_activate_default_mode_for_user_turn(self, user_input: str) -> None:
+        """Activate configured default_mode for a real top-level CLI user turn."""
+        text = (user_input or "").strip() if isinstance(user_input, str) else ""
+        if not text or _looks_like_slash_command(text):
+            return
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.default_mode import (
+                activate_ultrawork_on_agent,
+                is_default_ralph_loop_enabled,
+                is_default_ultrawork_enabled,
+            )
+        except Exception as exc:
+            logging.debug("default_mode unavailable: %s", exc)
+            return
+
+        try:
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+
+        if is_default_ultrawork_enabled(cfg):
+            try:
+                activate_ultrawork_on_agent(getattr(self, "agent", None))
+            except Exception as exc:
+                logging.debug("default_mode ultrawork activation failed: %s", exc)
+
+        if not is_default_ralph_loop_enabled(cfg):
+            return
+        mgr = self._get_goal_manager()
+        if mgr is None or mgr.has_goal():
+            return
+        try:
+            state = mgr.set(text)
+            _cprint(f"  ⊙ Default /goal started ({state.max_turns}-turn budget): {state.goal}")
+        except Exception as exc:
+            logging.debug("default_mode ralph_loop activation failed: %s", exc)
+
     def _maybe_continue_goal_after_turn(self) -> None:
         """Hook run after every CLI turn. Judges + maybe re-queues.
 
@@ -13617,6 +13655,11 @@ class HermesCLI:
                     # Regular chat - run agent
                     self._agent_running = True
                     app.invalidate()  # Refresh status line
+
+                    try:
+                        self._maybe_activate_default_mode_for_user_turn(user_input)
+                    except Exception as _default_mode_exc:
+                        logging.debug("default_mode activation hook failed: %s", _default_mode_exc)
 
                     try:
                         self.chat(user_input, images=submit_images or None)

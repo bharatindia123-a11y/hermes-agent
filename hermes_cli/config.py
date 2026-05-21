@@ -1238,6 +1238,14 @@ DEFAULT_CONFIG = {
     # Never saved to sessions, logs, or trajectories.
     "prefill_messages_file": "",
 
+    # OMO v4.3 default-mode auto activation. Disabled by default; top-level
+    # adapters opt into Hermes-native ultrawork prompt overlay and /goal
+    # Ralph-loop startup on the first real user turn.
+    "default_mode": {
+        "ultrawork": False,
+        "ralph_loop": False,
+    },
+
     # Goals — persistent cross-turn goals (Ralph-style loop).
     # After every turn, a lightweight judge call asks the auxiliary model
     # whether the active /goal is satisfied by the assistant's last
