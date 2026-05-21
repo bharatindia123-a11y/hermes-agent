@@ -694,6 +694,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
+        elif function_name == "background_agent":
+            function_result = agent._dispatch_background_agent(function_args, effective_task_id)
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('background_agent', function_args, tool_duration, result=function_result)}")
+        elif function_name in {"team_spawn", "team_list", "team_status", "team_output", "team_cancel"}:
+            function_result = agent._dispatch_team_mode(function_name, function_args, effective_task_id)
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None

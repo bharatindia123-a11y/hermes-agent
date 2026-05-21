@@ -50,7 +50,7 @@ def _resolve_skill_commands_platform() -> Optional[str]:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
-def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
+def _load_skill_payload(skill_identifier: str, task_id: str | None = None, target_agent: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
     if not raw_identifier:
@@ -91,7 +91,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             normalized = raw_identifier.lstrip("/")
 
         loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
+            skill_view(normalized, task_id=task_id, preprocess=False, target_agent=target_agent)
         )
     except Exception:
         return None
@@ -260,7 +260,7 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
-def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
+def scan_skill_commands(target_agent: str | None = None) -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
     Returns:
@@ -271,7 +271,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, skill_matches_target_agent
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
 
@@ -290,6 +290,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     frontmatter, body = _parse_frontmatter(content)
                     # Skip skills incompatible with the current OS platform
                     if not skill_matches_platform(frontmatter):
+                        continue
+                    if not skill_matches_target_agent(frontmatter, target_agent):
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
@@ -430,6 +432,7 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
+    target_agent: str | None = None,
 ) -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
@@ -445,7 +448,7 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
+    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id, target_agent=target_agent)
     if not loaded:
         return None
 
@@ -475,6 +478,7 @@ def build_skill_invocation_message(
 def build_preloaded_skills_prompt(
     skill_identifiers: list[str],
     task_id: str | None = None,
+    target_agent: str | None = None,
 ) -> tuple[str, list[str], list[str]]:
     """Load one or more skills for session-wide CLI preloading.
 
@@ -491,7 +495,7 @@ def build_preloaded_skills_prompt(
             continue
         seen.add(identifier)
 
-        loaded = _load_skill_payload(identifier, task_id=task_id)
+        loaded = _load_skill_payload(identifier, task_id=task_id, target_agent=target_agent)
         if not loaded:
             missing.append(identifier)
             continue

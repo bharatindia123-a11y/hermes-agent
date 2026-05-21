@@ -428,6 +428,43 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert "backend-skill" in result
 
+    def test_filters_skills_by_target_agent_scope(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills" / "agents"
+        public_skill = skills_dir / "public"
+        builder_skill = skills_dir / "builder-only"
+        reviewer_skill = skills_dir / "reviewer-only"
+        public_skill.mkdir(parents=True)
+        builder_skill.mkdir(parents=True)
+        reviewer_skill.mkdir(parents=True)
+        (public_skill / "SKILL.md").write_text(
+            "---\nname: public\ndescription: Public skill\n---\n"
+        )
+        (builder_skill / "SKILL.md").write_text(
+            "---\nname: builder-only\ndescription: Builder skill\ntarget_agent: Builder_Agent\n---\n"
+        )
+        (reviewer_skill / "SKILL.md").write_text(
+            "---\nname: reviewer-only\ndescription: Reviewer skill\nagent: reviewer-agent\n---\n"
+        )
+
+        prompt = build_skills_system_prompt(target_agent="builder-agent")
+
+        assert "public" in prompt
+        assert "builder-only" in prompt
+        assert "reviewer-only" not in prompt
+
+    def test_targeted_skills_hidden_when_no_named_agent_identity(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "agents" / "targeted"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: targeted\ndescription: Targeted\ntarget_agent: builder\n---\n"
+        )
+
+        prompt = build_skills_system_prompt()
+
+        assert "targeted" not in prompt
+
 
 class TestBuildNousSubscriptionPrompt:
     def test_includes_active_subscription_features(self, monkeypatch):

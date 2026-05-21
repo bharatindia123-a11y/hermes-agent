@@ -135,3 +135,14 @@ def test_named_workflows_resolve_separately_from_specialists_and_runtime_modes()
     assert resolve_named_workflow("missing") is None
     assert resolve_named_workflow("planner").mode == "plan"
     assert resolve_named_workflow("deep_worker").mode == "execute"
+
+
+def test_looker_specialist_allows_look_at():
+    from agent.archetypes import resolve_specialist_mapping
+
+    mapping = resolve_specialist_mapping("looker")
+    assert mapping is not None
+    allowed = set(mapping.allowed_tools)
+    assert "look_at" in allowed
+    assert "vision_analyze" in allowed
+    assert "browser_vision" in allowed

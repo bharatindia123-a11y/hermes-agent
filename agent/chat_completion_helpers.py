@@ -53,6 +53,11 @@ from agent.tool_dispatch_helpers import (
     _multimodal_text_summary,
 )
 from agent.retry_utils import jittered_backoff
+from agent.provider_fallback import (
+    build_fallback_provenance,
+    normalize_provider_name,
+    should_try_runtime_fallback,
+)
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
     append_toolguard_guidance,
@@ -663,7 +668,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(agent, reason: "FailoverReason | None" = None, status_code: int | None = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -683,16 +688,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            _cooldown = int((getattr(agent, "_runtime_fallback_config", {}) or {}).get("cooldown_seconds", 60) or 0)
+            agent._rate_limited_until = time.monotonic() + _cooldown
+    _runtime_fb_cfg = getattr(agent, "_runtime_fallback_config", {}) or {}
+    if _runtime_fb_cfg.get("enabled", True) is False:
+        logging.info("Runtime provider fallback disabled by config")
+        return False
+    _max_attempts = _runtime_fb_cfg.get("max_fallback_attempts")
+    if _max_attempts is not None and len(getattr(agent, "_fallback_events", []) or []) >= int(_max_attempts):
+        logging.info("Runtime provider fallback max attempts exhausted: %s", _max_attempts)
+        return False
     if agent._fallback_index >= len(agent._fallback_chain):
         return False
 
     fb = agent._fallback_chain[agent._fallback_index]
+    _chain_index = agent._fallback_index
     agent._fallback_index += 1
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback()  # skip invalid, try next
+    if normalize_provider_name(fb_provider) in (getattr(agent, "_disabled_fallback_providers", set()) or set()):
+        logging.warning("Fallback skip: provider %s is disabled by config", fb_provider)
+        return agent._try_activate_fallback()
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
@@ -786,6 +804,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_api_mode = "bedrock_converse"
 
         old_model = agent.model
+        old_provider = getattr(agent, "provider", "")
+        old_base_url = getattr(agent, "base_url", "")
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -880,13 +900,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 provider=agent.provider,
             )
 
-        agent._emit_status(
-            f"🔄 Primary model failed — switching to fallback: "
-            f"{fb_model} via {fb_provider}"
+        _fallback_event = build_fallback_provenance(
+            reason=reason,
+            status_code=status_code,
+            from_provider=old_provider,
+            from_model=old_model,
+            from_base_url=old_base_url,
+            to_provider=fb_provider,
+            to_model=fb_model,
+            to_base_url=fb_base_url,
+            chain_index=_chain_index,
         )
+        agent._last_fallback_event = _fallback_event
+        if not hasattr(agent, "_fallback_events") or getattr(agent, "_fallback_events") is None:
+            agent._fallback_events = []
+        agent._fallback_events.append(_fallback_event)
+        if (getattr(agent, "_runtime_fallback_config", {}) or {}).get("notify_on_fallback", True):
+            agent._emit_status(
+                f"🔄 Primary model failed — switching to fallback: "
+                f"{fb_model} via {fb_provider}"
+            )
         logging.info(
-            "Fallback activated: %s → %s (%s)",
-            old_model, fb_model, fb_provider,
+            "Fallback activated: %s/%s → %s/%s (provenance=%s)",
+            old_provider, old_model, fb_provider, fb_model, _fallback_event,
         )
         return True
     except Exception as e:

@@ -358,3 +358,16 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("42") == 42
         assert _coerce_number("3.14") == 3.14
         assert _coerce_number("1e3") == 1000
+
+
+def test_background_agent_is_agent_loop_tool():
+    import model_tools
+
+    assert "background_agent" in model_tools._AGENT_LOOP_TOOLS
+
+
+def test_team_tools_are_agent_loop_tools():
+    import model_tools
+
+    for name in ["team_spawn", "team_list", "team_status", "team_output", "team_cancel"]:
+        assert name in model_tools._AGENT_LOOP_TOOLS

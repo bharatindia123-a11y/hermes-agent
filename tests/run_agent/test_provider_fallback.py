@@ -305,3 +305,58 @@ class TestFallbackChainDedup:
 
         assert ok is False
         mock_resolve.assert_not_called()
+
+
+# ── Disabled providers + provenance hardening ─────────────────────────────
+
+class TestFallbackDisabledProvidersAndProvenance:
+    def test_init_prunes_disabled_fallback_providers(self):
+        fbs = [
+            {"provider": "openai", "model": "gpt-5.5"},
+            {"provider": "zai", "model": "glm-4.7"},
+        ]
+        with patch("hermes_cli.config.load_config", return_value={"disabled_providers": ["openai"]}):
+            agent = _make_agent(fallback_model=fbs)
+
+        assert agent._disabled_fallback_providers == {"openai"}
+        assert agent._fallback_chain == [{"provider": "zai", "model": "glm-4.7"}]
+
+    def test_activation_records_provider_fallback_provenance(self):
+        fbs = [{"provider": "openai", "model": "gpt-5.5"}]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "openrouter"
+        agent.model = "z-ai/glm-4.7"
+        agent.base_url = "https://openrouter.ai/api/v1"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://api.openai.com/v1"), "gpt-5.5"),
+        ):
+            assert agent._try_activate_fallback(reason=None, status_code=429) is True
+
+        assert len(agent._fallback_events) == 1
+        event = agent._last_fallback_event
+        assert event["provenance"] == "provider-fallback"
+        assert event["status_code"] == 429
+        assert event["from_provider"] == "openrouter"
+        assert event["from_model"] == "z-ai/glm-4.7"
+        assert event["to_provider"] == "openai"
+        assert event["to_model"] == "gpt-5.5"
+
+    def test_runtime_fallback_disabled_prevents_activation(self):
+        agent = _make_agent(fallback_model={"provider": "openai", "model": "gpt-5.5"})
+        agent._runtime_fallback_config = {"enabled": False}
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            assert agent._try_activate_fallback() is False
+
+        mock_resolve.assert_not_called()
+
+    def test_runtime_fallback_max_attempts_limits_activation(self):
+        agent = _make_agent(fallback_model={"provider": "openai", "model": "gpt-5.5"})
+        agent._runtime_fallback_config = {"enabled": True, "max_fallback_attempts": 0}
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            assert agent._try_activate_fallback() is False
+
+        mock_resolve.assert_not_called()

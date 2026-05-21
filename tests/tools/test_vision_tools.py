@@ -13,6 +13,8 @@ import pytest
 from tools.vision_tools import (
     _validate_image_url,
     _handle_vision_analyze,
+    _handle_look_at,
+    check_look_at_requirements,
     _determine_mime_type,
     _image_to_base64_data_url,
     _resize_image_for_vision,
@@ -918,3 +920,56 @@ class TestIsImageSizeError:
 
     def test_empty_message(self):
         assert not _is_image_size_error(Exception(""))
+
+
+class TestLookAtWrapper:
+    def test_delegates_image_target_to_vision_analyze(self):
+        async def fake_vision(args, **kw):
+            return json.dumps({"success": True, "via": "vision", "args": args})
+
+        with patch("tools.vision_tools._handle_vision_analyze", side_effect=fake_vision) as mock_vision:
+            result = asyncio.run(_handle_look_at({"target": "/tmp/image.png", "question": "what?"}))
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["via"] == "vision"
+        mock_vision.assert_called_once()
+        assert mock_vision.call_args.args[0] == {"image_url": "/tmp/image.png", "question": "what?"}
+
+    def test_delegates_browser_target_to_browser_vision(self):
+        with patch("tools.browser_tool.browser_vision", return_value=json.dumps({"success": True, "via": "browser"})) as mock_browser:
+            result = asyncio.run(
+                _handle_look_at(
+                    {"target": "browser", "question": "what page?", "annotate": True},
+                    task_id="t1",
+                )
+            )
+
+        payload = json.loads(result)
+        assert payload["success"] is True
+        assert payload["via"] == "browser"
+        mock_browser.assert_called_once_with(question="what page?", annotate=True, task_id="t1")
+
+    def test_rejects_empty_target(self):
+        result = asyncio.run(_handle_look_at({"target": "", "question": "what?"}))
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "requires a target" in payload["error"]
+
+    def test_check_look_at_requirements_true_when_vision_available(self):
+        with patch("tools.vision_tools.check_vision_requirements", return_value=True):
+            assert check_look_at_requirements() is True
+
+    def test_check_look_at_requirements_true_when_browser_available(self):
+        with (
+            patch("tools.vision_tools.check_vision_requirements", return_value=False),
+            patch("tools.browser_tool.check_browser_requirements", return_value=True),
+        ):
+            assert check_look_at_requirements() is True
+
+    def test_check_look_at_requirements_false_when_neither_available(self):
+        with (
+            patch("tools.vision_tools.check_vision_requirements", return_value=False),
+            patch("tools.browser_tool.check_browser_requirements", return_value=False),
+        ):
+            assert check_look_at_requirements() is False

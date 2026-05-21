@@ -62,6 +62,7 @@ from agent.nous_rate_guard import (
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.retry_utils import jittered_backoff
+from agent.provider_fallback import should_try_runtime_fallback
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import display_hermes_home as _dhh_fn
@@ -1969,7 +1970,7 @@ def run_conversation(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
                     classified.retryable, classified.should_compress,
-                    classified.should_rotate_credential, classified.should_fallback,
+                    classified.should_rotate_credential, should_try_runtime_fallback(classified, getattr(agent, "_runtime_fallback_config", {})),
                 )
 
                 recovered_with_pool, has_retried_429 = agent._recover_with_credential_pool(
@@ -2338,7 +2339,7 @@ def run_conversation(
                     )
                     if not pool_may_recover:
                         agent._emit_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if agent._try_activate_fallback(reason=classified.reason, status_code=classified.status_code):
                             retry_count = 0
                             compression_attempts = 0
                             primary_recovery_attempted = False
@@ -2699,7 +2700,7 @@ def run_conversation(
                     # Try fallback before aborting — a different provider
                     # may not have the same issue (rate limit, auth, etc.)
                     agent._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if should_try_runtime_fallback(classified, getattr(agent, "_runtime_fallback_config", {})) and agent._try_activate_fallback(reason=classified.reason, status_code=classified.status_code):
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False
@@ -2770,7 +2771,7 @@ def run_conversation(
                         continue
                     # Try fallback before giving up entirely
                     agent._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if should_try_runtime_fallback(classified, getattr(agent, "_runtime_fallback_config", {})) and agent._try_activate_fallback(reason=classified.reason, status_code=classified.status_code):
                         retry_count = 0
                         compression_attempts = 0
                         primary_recovery_attempted = False

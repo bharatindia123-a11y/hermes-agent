@@ -1546,6 +1546,10 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         )
     elif function_name == "delegate_task":
         return agent._dispatch_delegate_task(function_args)
+    elif function_name == "background_agent":
+        return agent._dispatch_background_agent(function_args, effective_task_id)
+    elif function_name in {"team_spawn", "team_list", "team_status", "team_output", "team_cancel"}:
+        return agent._dispatch_team_mode(function_name, function_args, effective_task_id)
     else:
         return _ra().handle_function_call(
             function_name, function_args, effective_task_id,

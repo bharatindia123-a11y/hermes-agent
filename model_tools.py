@@ -219,7 +219,7 @@ _last_resolved_tool_names: List[str] = []
 _LEGACY_TOOLSET_MAP = {
     "web_tools": ["web_search", "web_extract"],
     "terminal_tools": ["terminal"],
-    "vision_tools": ["vision_analyze"],
+    "vision_tools": ["look_at", "vision_analyze"],
     "moa_tools": ["mixture_of_agents"],
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
@@ -482,7 +482,7 @@ def _compute_tool_definitions(
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task", "background_agent", "team_spawn", "team_list", "team_status", "team_output", "team_cancel"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 

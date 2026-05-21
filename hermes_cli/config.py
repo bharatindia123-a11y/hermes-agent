@@ -503,8 +503,24 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    "disabled_providers": [],
     "fallback_providers": [],
+    "runtime_fallback": {
+        "enabled": True,
+        "retry_on_errors": [401, 402, 403, 404, 429, 500, 502, 503, 529],
+        "max_fallback_attempts": None,
+        "cooldown_seconds": 60,
+        "timeout_seconds": None,
+        "notify_on_fallback": True,
+    },
     "credential_pool_strategies": {},
+    "background_agents": {
+        "max_concurrent": 3,
+        "max_retained_jobs": 100,
+    },
+    "team_mode": {
+        "enabled": False,
+    },
     "toolsets": ["hermes-cli"],
     "agent": {
         "max_turns": 90,

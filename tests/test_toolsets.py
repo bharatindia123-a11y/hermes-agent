@@ -254,3 +254,20 @@ class TestDefaultPlatformWebSearchCoverage:
 
     def test_hermes_api_server_toolset_includes_web_search(self):
         assert "web_search" in resolve_toolset("hermes-api-server")
+
+
+def test_background_agents_toolset_is_opt_in():
+    from toolsets import resolve_toolset
+
+    assert "background_agent" in resolve_toolset("background_agents")
+    assert "background_agent" not in resolve_toolset("hermes-cli")
+
+
+def test_team_mode_toolset_is_opt_in():
+    from toolsets import resolve_toolset
+
+    team_tools = resolve_toolset("team_mode")
+    assert "team_spawn" in team_tools
+    assert "team_list" in team_tools
+    assert "background_agent" in team_tools
+    assert "team_spawn" not in resolve_toolset("hermes-cli")

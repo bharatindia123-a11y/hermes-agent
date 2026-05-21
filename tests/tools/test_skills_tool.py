@@ -1241,3 +1241,43 @@ class TestSkillViewCollisionDetection:
         result = json.loads(raw)
         assert result["success"] is True
         assert "LOCAL BODY" in result["content"]
+
+
+class TestTargetAgentScopedSkills:
+    def test_find_all_skills_filters_by_target_agent(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "public")
+            _make_skill(tmp_path, "builder-only", frontmatter_extra="target_agent: Builder_Agent\n")
+            _make_skill(tmp_path, "reviewer-only", frontmatter_extra="agent: reviewer-agent\n")
+
+            skills = _find_all_skills(target_agent="builder-agent")
+
+        names = {s["name"] for s in skills}
+        assert names == {"public", "builder-only"}
+
+    def test_skill_view_rejects_wrong_target_without_returning_body(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "builder-only",
+                frontmatter_extra="target_agent: builder\n",
+                body="SECRET BUILDER BODY",
+            )
+            result = json.loads(skill_view("builder-only", target_agent="reviewer"))
+
+        assert result["success"] is False
+        assert "target_agent" in result["error"]
+        assert "SECRET BUILDER BODY" not in json.dumps(result)
+
+    def test_skill_view_allows_matching_target_alias(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "reviewer-only",
+                frontmatter_extra="agent: reviewer_agent\n",
+                body="Reviewer instructions",
+            )
+            result = json.loads(skill_view("reviewer-only", target_agent="reviewer-agent"))
+
+        assert result["success"] is True
+        assert "Reviewer instructions" in result["content"]

@@ -42,6 +42,11 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.provider_fallback import (
+    disabled_providers_from_config,
+    normalize_fallback_chain,
+    runtime_fallback_config_from_config,
+)
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -137,6 +142,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    delegate_resolution: Dict[str, Any] | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -198,7 +204,7 @@ def init_agent(
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
-    agent._delegate_resolution: Dict[str, Any] = {}
+    agent._delegate_resolution: Dict[str, Any] = dict(delegate_resolution or {})
     agent._delegate_runtime_mode: Optional[str] = None
     agent._delegate_named_workflow: Optional[Dict[str, Any]] = None
     agent._delegate_task_contract: Optional[Dict[str, Any]] = None
@@ -782,18 +788,24 @@ def init_agent(
     # Provider fallback chain — ordered list of backup providers tried
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
-    # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
-        agent._fallback_chain = [
-            f for f in fallback_model
-            if isinstance(f, dict) and f.get("provider") and f.get("model")
-        ]
-    elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
-        agent._fallback_chain = [fallback_model]
-    else:
-        agent._fallback_chain = []
+    # new list ``fallback_providers`` format.  OMO v4.3.0-inspired
+    # hardening: prune globally disabled providers before runtime use and
+    # keep a structured runtime_fallback config/provenance trail.
+    try:
+        from hermes_cli.config import load_config as _load_fallback_cfg
+        _fallback_cfg = _load_fallback_cfg()
+    except Exception:
+        _fallback_cfg = {}
+    agent._disabled_fallback_providers = disabled_providers_from_config(_fallback_cfg)
+    agent._runtime_fallback_config = runtime_fallback_config_from_config(_fallback_cfg)
+    agent._fallback_chain = normalize_fallback_chain(
+        fallback_model,
+        disabled_providers=agent._disabled_fallback_providers,
+    )
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
+    agent._fallback_events = []
+    agent._last_fallback_event = None
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     if agent._fallback_chain and not agent.quiet_mode:

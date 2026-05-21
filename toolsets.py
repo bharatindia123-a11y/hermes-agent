@@ -36,7 +36,7 @@ _HERMES_CORE_TOOLS = [
     # File manipulation
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
-    "vision_analyze", "image_generate",
+    "look_at", "vision_analyze", "image_generate",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
@@ -102,7 +102,7 @@ TOOLSETS = {
     
     "vision": {
         "description": "Image analysis and vision tools",
-        "tools": ["vision_analyze"],
+        "tools": ["look_at", "vision_analyze"],
         "includes": []
     },
 
@@ -230,6 +230,18 @@ TOOLSETS = {
         "includes": []
     },
 
+    "background_agents": {
+        "description": "Create and manage background agent jobs (opt-in; Team Mode prerequisite)",
+        "tools": ["background_agent"],
+        "includes": []
+    },
+
+    "team_mode": {
+        "description": "Disabled-by-default Team Mode MVP tools backed by background_agent jobs",
+        "tools": ["team_spawn", "team_list", "team_status", "team_output", "team_cancel"],
+        "includes": ["background_agents"]
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -334,7 +346,7 @@ TOOLSETS = {
             "web_search", "web_extract",
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
-            "vision_analyze",
+            "look_at", "vision_analyze",
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
@@ -357,7 +369,7 @@ TOOLSETS = {
             # File manipulation
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
-            "vision_analyze", "image_generate",
+            "look_at", "vision_analyze", "image_generate",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation

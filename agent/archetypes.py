@@ -334,6 +334,7 @@ SPECIALIST_MAPPINGS_BY_NAME: Final[Mapping[str, SpecialistMapping]] = MappingPro
                 allowed_tools=(
                     "read_file",
                     "search_files",
+                    "look_at",
                     "vision_analyze",
                     "browser_vision",
                     "browser_snapshot",

@@ -547,7 +547,7 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         return False
 
 
-def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
+def _find_all_skills(*, skip_disabled: bool = False, target_agent: str | None = None) -> List[Dict[str, Any]]:
     """Recursively find all skills in ~/.hermes/skills/ and external dirs.
 
     Args:
@@ -584,6 +584,9 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 frontmatter, body = _parse_frontmatter(content)
 
                 if not skill_matches_platform(frontmatter):
+                    continue
+                from agent.skill_utils import skill_matches_target_agent
+                if not skill_matches_target_agent(frontmatter, target_agent):
                     continue
 
                 name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
@@ -672,7 +675,7 @@ def _load_category_description(category_dir: Path) -> Optional[str]:
         return None
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(category: str = None, task_id: str = None, target_agent: str | None = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -700,7 +703,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
             )
 
         # Find all skills
-        all_skills = _find_all_skills()
+        all_skills = _find_all_skills(target_agent=target_agent)
 
         if not all_skills:
             return json.dumps(
@@ -852,6 +855,7 @@ def skill_view(
     file_path: str = None,
     task_id: str = None,
     preprocess: bool = True,
+    target_agent: str | None = None,
 ) -> str:
     """
     View the content of a skill or a specific file within a skill directory.
@@ -1103,6 +1107,15 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
+
+        from agent.skill_utils import skill_target_mismatch_error
+        target_error = skill_target_mismatch_error(
+            parsed_frontmatter.get("name", name),
+            parsed_frontmatter,
+            target_agent=target_agent,
+        )
+        if target_error:
+            return json.dumps({"success": False, "error": target_error}, ensure_ascii=False)
 
         # Check if the skill is disabled by the user
         resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
@@ -1497,6 +1510,10 @@ SKILLS_LIST_SCHEMA = {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
+            },
+            "target_agent": {
+                "type": "string",
+                "description": "Current named-agent target for scoped skill filtering. Normally omitted; subagent runtimes set this internally.",
             }
         },
         "required": [],
@@ -1527,7 +1544,7 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"), task_id=kw.get("task_id"), target_agent=args.get("target_agent")
     ),
     check_fn=check_skills_requirements,
     emoji="📚",
@@ -1537,7 +1554,7 @@ def _skill_view_with_bump(args, **kw):
     telemetry failure never breaks the tool call."""
     name = args.get("name", "")
     result = skill_view(
-        name, file_path=args.get("file_path"), task_id=kw.get("task_id")
+        name, file_path=args.get("file_path"), task_id=kw.get("task_id"), target_agent=args.get("target_agent")
     )
     try:
         parsed = json.loads(result)

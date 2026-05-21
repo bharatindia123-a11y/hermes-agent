@@ -596,7 +596,7 @@ _DEFAULT_ABILITY_CONFIGS: Dict[str, Dict[str, Any]] = {
         "route_category": "visual",
         "delegation_profile": "research",
         "runtime_mode": "default",
-        "allowed_tools": ["read_file", "search_files", "vision_analyze", "browser_vision", "browser_snapshot", "browser_get_images", "browser_console"],
+        "allowed_tools": ["read_file", "search_files", "look_at", "vision_analyze", "browser_vision", "browser_snapshot", "browser_get_images", "browser_console"],
     },
     "hephaestus": {
         "agent": "hephaestus",

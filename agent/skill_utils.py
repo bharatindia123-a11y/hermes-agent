@@ -168,6 +168,101 @@ def _normalize_string_set(values) -> Set[str]:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
+# ── Target-agent scoped skills ─────────────────────────────────────────────
+
+def canonical_agent_key(value: Any) -> str:
+    """Canonicalize a named-agent key for target-scoped skills.
+
+    Profiles, categories, route categories, and delegation profiles are not agent
+    identities. This helper only normalizes an already-selected named agent or
+    explicit skill target.
+    """
+    if value is None:
+        return ""
+    key = str(value).strip().lower()
+    if not key:
+        return ""
+    key = re.sub(r"[\s_]+", "-", key)
+    key = re.sub(r"-+", "-", key)
+    return key.strip("-")
+
+def _iter_agent_target_values(value: Any):
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_agent_target_values(item)
+        return
+    yield value
+
+def skill_target_agents(frontmatter: Dict[str, Any] | None) -> Set[str]:
+    """Return canonical target agents declared by skill frontmatter.
+
+    Supports top-level ``target_agent`` and compatibility alias ``agent``. Both
+    fields accept scalar or list values. Empty set means the skill is public.
+    """
+    fm = frontmatter or {}
+    targets: Set[str] = set()
+    for field in ("target_agent", "agent"):
+        for raw in _iter_agent_target_values(fm.get(field)) or []:
+            key = canonical_agent_key(raw)
+            if key:
+                targets.add(key)
+    return targets
+
+def runtime_target_agent(delegate_resolution: Dict[str, Any] | None = None, explicit_target: str | None = None) -> str:
+    """Resolve the current named-agent identity for skill scoping.
+
+    Only explicit named-agent fields are considered. This intentionally ignores
+    profile, category, route_category, delegation_profile, runtime_mode,
+    archetype, and specialist so scoped skills cannot leak through routing lanes
+    or hosting boundaries.
+    """
+    if explicit_target:
+        return canonical_agent_key(explicit_target)
+    resolution = delegate_resolution or {}
+    for field in ("agent", "named_agent"):
+        key = canonical_agent_key(resolution.get(field))
+        if key:
+            return key
+    return ""
+
+def skill_matches_target_agent(
+    frontmatter: Dict[str, Any] | None,
+    target_agent: str | None = None,
+    delegate_resolution: Dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a skill is visible for the active target agent.
+
+    Public skills (no ``target_agent``/``agent`` metadata) always match. Targeted
+    skills only match an explicit canonical named-agent identity.
+    """
+    targets = skill_target_agents(frontmatter)
+    if not targets:
+        return True
+    active = runtime_target_agent(delegate_resolution, target_agent)
+    return bool(active and active in targets)
+
+def skill_target_mismatch_error(
+    skill_name: str,
+    frontmatter: Dict[str, Any] | None,
+    target_agent: str | None = None,
+    delegate_resolution: Dict[str, Any] | None = None,
+) -> str | None:
+    """Return an explicit wrong-target message, or None when the skill matches."""
+    targets = sorted(skill_target_agents(frontmatter))
+    if not targets:
+        return None
+    active = runtime_target_agent(delegate_resolution, target_agent)
+    if active and active in targets:
+        return None
+    active_label = active or "<none>"
+    return (
+        f"Skill '{skill_name}' is scoped to target_agent={targets} and is not "
+        f"available for current target agent '{active_label}'."
+    )
+
+
 # ── External skills directories ──────────────────────────────────────────
 
 # (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by

@@ -800,3 +800,35 @@ class TestInlineShellExpansion:
         # The command's intended stdout never made it through — only the
         # timeout marker (which echoes the command text) survives.
         assert "DYN_MARKER" not in msg.replace("sleep 5 && printf DYN_MARKER", "")
+
+
+class TestTargetAgentScopedSkillCommands:
+    def test_scan_skill_commands_filters_wrong_target(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "public")
+            _make_skill(tmp_path, "builder-only", frontmatter_extra="target_agent: builder\n")
+            _make_skill(tmp_path, "reviewer-only", frontmatter_extra="target_agent: reviewer\n")
+            result = scan_skill_commands(target_agent="builder")
+
+        assert "/public" in result
+        assert "/builder-only" in result
+        assert "/reviewer-only" not in result
+
+    def test_preloaded_skill_wrong_target_is_reported_missing(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "builder-only", frontmatter_extra="target_agent: builder\n", body="Builder body")
+            prompt, loaded, missing = build_preloaded_skills_prompt(["builder-only"], target_agent="reviewer")
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["builder-only"]
+
+    def test_skill_invocation_allows_matching_target(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "builder-only", frontmatter_extra="target_agent: builder_agent\n", body="Builder body")
+            cmds = scan_skill_commands(target_agent="builder-agent")
+            message = build_skill_invocation_message("/builder-only", target_agent="builder-agent")
+
+        assert "/builder-only" in cmds
+        assert message is not None
+        assert "Builder body" in message

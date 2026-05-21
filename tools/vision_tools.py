@@ -1011,6 +1011,87 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+LOOK_AT_SCHEMA = {
+    "name": "look_at",
+    "description": (
+        "Convenience visual inspection wrapper. Use this when the user asks you "
+        "to look at, inspect, or visually analyze an image, local image file, "
+        "or the current browser page. Image targets delegate to vision_analyze; "
+        "browser/page/screenshot targets delegate to browser_vision."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": (
+                    "What to look at: image URL, local image path, file:// URI, "
+                    "or one of 'browser', 'page', 'current browser', 'screenshot'."
+                ),
+            },
+            "question": {
+                "type": "string",
+                "description": "Specific question or instruction about what to inspect.",
+            },
+            "annotate": {
+                "type": "boolean",
+                "default": False,
+                "description": "For browser/page targets only: overlay numbered labels on interactive elements.",
+            },
+        },
+        "required": ["target", "question"],
+    },
+}
+
+_BROWSER_LOOK_AT_TARGETS = {
+    "browser",
+    "page",
+    "current page",
+    "current browser",
+    "browser page",
+    "screenshot",
+    "current screenshot",
+}
+
+def check_look_at_requirements() -> bool:
+    """Available when either image vision or browser vision is available."""
+    if check_vision_requirements():
+        return True
+    try:
+        from tools.browser_tool import check_browser_requirements
+        return bool(check_browser_requirements())
+    except Exception:
+        return False
+
+def _handle_look_at(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
+    target = str(args.get("target") or "").strip()
+    question = str(args.get("question") or "").strip() or "Describe what you see."
+    annotate = bool(args.get("annotate", False))
+
+    async def _run():
+        normalized = target.lower()
+        if normalized in _BROWSER_LOOK_AT_TARGETS:
+            try:
+                from tools.browser_tool import browser_vision
+                return browser_vision(
+                    question=question,
+                    annotate=annotate,
+                    task_id=kw.get("task_id"),
+                )
+            except Exception as exc:
+                return tool_error(f"look_at browser target failed: {exc}", success=False)
+
+        if not target:
+            return tool_error("look_at requires a target image path/URL or browser target", success=False)
+
+        return await _handle_vision_analyze(
+            {"image_url": target, "question": question},
+            **kw,
+        )
+
+    return _run()
+
+
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
@@ -1053,6 +1134,16 @@ registry.register(
     schema=VISION_ANALYZE_SCHEMA,
     handler=_handle_vision_analyze,
     check_fn=check_vision_requirements,
+    is_async=True,
+    emoji="👁️",
+)
+
+registry.register(
+    name="look_at",
+    toolset="vision",
+    schema=LOOK_AT_SCHEMA,
+    handler=_handle_look_at,
+    check_fn=check_look_at_requirements,
     is_async=True,
     emoji="👁️",
 )

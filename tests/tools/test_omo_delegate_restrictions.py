@@ -269,3 +269,12 @@ def test_mcp_inheritance_cannot_restore_blocked_tools_after_filtering():
         },
     )
     assert child.valid_tool_names == {"read_file"}
+
+
+def test_multimodal_looker_allows_look_at():
+    from tools.delegate_tool import _DEFAULT_ABILITY_CONFIGS
+
+    allowed = set(_DEFAULT_ABILITY_CONFIGS["multimodal-looker"]["allowed_tools"])
+    assert "look_at" in allowed
+    assert "vision_analyze" in allowed
+    assert "browser_vision" in allowed

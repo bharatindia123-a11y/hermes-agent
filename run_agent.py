@@ -413,6 +413,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        delegate_resolution: Dict[str, Any] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -482,6 +483,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            delegate_resolution=delegate_resolution,
         )
 
     def _get_session_db_for_recall(self):
@@ -3063,10 +3065,10 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(self, reason: "FailoverReason | None" = None, status_code: int | None = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(self, reason, status_code=status_code)
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
@@ -3966,6 +3968,70 @@ class AIAgent:
             task_contract=function_args.get("task_contract"),
             named_workflow=function_args.get("named_workflow"),
             parent_agent=self,
+        )
+
+    def _dispatch_team_mode(self, function_name: str, function_args: dict, effective_task_id: str | None = None) -> str:
+        """Single call site for disabled-by-default Team Mode tools."""
+        from tools.team_mode_tool import (
+            team_cancel_tool as _team_cancel_tool,
+            team_list_tool as _team_list_tool,
+            team_output_tool as _team_output_tool,
+            team_spawn_tool as _team_spawn_tool,
+            team_status_tool as _team_status_tool,
+        )
+        if function_name == "team_spawn":
+            return _team_spawn_tool(
+                goal=function_args.get("goal", ""),
+                context=function_args.get("context"),
+                role=function_args.get("role"),
+                toolsets=function_args.get("toolsets"),
+                skills=function_args.get("skills"),
+                agent=function_args.get("agent"),
+                specialist=function_args.get("specialist"),
+                runtime_mode=function_args.get("runtime_mode"),
+                parent_agent=self,
+                task_id=effective_task_id,
+            )
+        if function_name == "team_list":
+            return _team_list_tool(parent_agent=self, task_id=effective_task_id)
+        if function_name == "team_status":
+            return _team_status_tool(team_member_id=function_args.get("team_member_id", ""), parent_agent=self, task_id=effective_task_id)
+        if function_name == "team_output":
+            return _team_output_tool(
+                team_member_id=function_args.get("team_member_id", ""),
+                offset=function_args.get("offset", 0),
+                limit=function_args.get("limit", 200),
+                parent_agent=self,
+                task_id=effective_task_id,
+            )
+        if function_name == "team_cancel":
+            return _team_cancel_tool(team_member_id=function_args.get("team_member_id", ""), parent_agent=self, task_id=effective_task_id)
+        return json.dumps({"success": False, "error": f"Unknown Team Mode tool: {function_name}"})
+
+    def _dispatch_background_agent(self, function_args: dict, effective_task_id: str | None = None) -> str:
+        """Single call site for background_agent dispatch."""
+        from tools.background_agent_tool import background_agent_tool as _background_agent_tool
+        return _background_agent_tool(
+            action=function_args.get("action", ""),
+            agent_id=function_args.get("agent_id"),
+            goal=function_args.get("goal"),
+            context=function_args.get("context"),
+            toolsets=function_args.get("toolsets"),
+            agent=function_args.get("agent"),
+            subagent_type=function_args.get("subagent_type"),
+            category=function_args.get("category"),
+            archetype=function_args.get("archetype"),
+            specialist=function_args.get("specialist"),
+            route_category=function_args.get("route_category"),
+            delegation_profile=function_args.get("delegation_profile"),
+            runtime_mode=function_args.get("runtime_mode"),
+            skills=function_args.get("skills"),
+            task_contract=function_args.get("task_contract"),
+            named_workflow=function_args.get("named_workflow"),
+            offset=function_args.get("offset", 0),
+            limit=function_args.get("limit", 200),
+            parent_agent=self,
+            task_id=effective_task_id,
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,

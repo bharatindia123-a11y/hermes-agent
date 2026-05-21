@@ -23,6 +23,8 @@ from agent.skill_utils import (
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_platform,
+    skill_matches_target_agent,
+    runtime_target_agent,
 )
 from utils import atomic_json_write
 
@@ -932,6 +934,8 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "target_agent": frontmatter.get("target_agent"),
+        "agent": frontmatter.get("agent"),
     }
 
 
@@ -992,6 +996,8 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    target_agent: str | None = None,
+    delegate_resolution: dict | None = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1023,6 +1029,7 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    effective_target_agent = runtime_target_agent(delegate_resolution, target_agent)
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1030,6 +1037,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        effective_target_agent,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1056,6 +1064,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if not skill_matches_target_agent(entry, effective_target_agent):
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1080,6 +1090,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if not skill_matches_target_agent(frontmatter, effective_target_agent):
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -1135,6 +1147,8 @@ def build_skills_system_prompt(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if not skill_matches_target_agent(frontmatter, effective_target_agent):
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),
