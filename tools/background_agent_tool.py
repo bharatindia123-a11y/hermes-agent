@@ -14,12 +14,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import get_hermes_home
 from tools.registry import registry
 
 
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "lost"}
 _DEFAULT_MAX_CONCURRENT = 3
 _DEFAULT_MAX_RETAINED = 100
 _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
@@ -28,6 +30,7 @@ _EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 _JOBS_LOCK = threading.RLock()
 _JOBS: Dict[str, "BackgroundAgentJob"] = {}
+_STORE_LOADED = False
 
 
 @dataclass
@@ -47,6 +50,7 @@ class BackgroundAgentJob:
     api_calls: int = 0
     child_session_id: str = ""
     cancel_requested: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
     future: Any = field(default=None, repr=False, compare=False)
     request: Dict[str, Any] = field(default_factory=dict, repr=False)
 
@@ -113,10 +117,160 @@ def _parent_session_id(parent_agent: Any = None) -> str:
 
 
 def _append_event(job: BackgroundAgentJob, event: str, **fields: Any) -> None:
-    job.output_events.append({"ts": time.time(), "event": event, **fields})
+    entry = {"ts": time.time(), "event": event, **fields}
+    job.output_events.append(entry)
+    _persist_event(job, entry)
+
+
+def _store_dir() -> Path:
+    return Path(get_hermes_home()) / "background_agents"
+
+
+def _job_meta_path(agent_id: str) -> Path:
+    return _store_dir() / f"{agent_id}.json"
+
+
+def _job_events_path(agent_id: str) -> Path:
+    return _store_dir() / f"{agent_id}.events.jsonl"
+
+
+def _json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value, ensure_ascii=False, default=str)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _persist_job_metadata(job: BackgroundAgentJob) -> None:
+    try:
+        directory = _store_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        request = {k: _json_safe(v) for k, v in (job.request or {}).items() if not str(k).startswith("_")}
+        data = {
+            "agent_id": job.agent_id,
+            "goal": job.goal,
+            "context": job.context,
+            "parent_session_id": job.parent_session_id,
+            "parent_task_id": job.parent_task_id,
+            "status": job.status,
+            "created_at": job.created_at,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "final_response": job.final_response,
+            "error": job.error,
+            "api_calls": job.api_calls,
+            "child_session_id": job.child_session_id,
+            "cancel_requested": job.cancel_requested,
+            "request": request,
+        }
+        tmp = _job_meta_path(job.agent_id).with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+        tmp.replace(_job_meta_path(job.agent_id))
+    except Exception:
+        # Background-agent persistence must not break the live tool path.
+        pass
+
+
+def _persist_event(job: BackgroundAgentJob, event: Dict[str, Any]) -> None:
+    try:
+        directory = _store_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        with _job_events_path(job.agent_id).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def _load_events(agent_id: str) -> List[Dict[str, Any]]:
+    path = _job_events_path(agent_id)
+    events: List[Dict[str, Any]] = []
+    try:
+        if not path.exists():
+            return events
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                events.append(parsed)
+    except Exception:
+        return events
+    return events
+
+
+def _coerce_optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _load_job_from_meta(path: Path) -> Optional[BackgroundAgentJob]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        agent_id = str(data.get("agent_id") or path.stem)
+        job = BackgroundAgentJob(
+            agent_id=agent_id,
+            goal=str(data.get("goal") or ""),
+            context=str(data.get("context") or ""),
+            parent_session_id=str(data.get("parent_session_id") or ""),
+            parent_task_id=str(data.get("parent_task_id") or ""),
+            status=str(data.get("status") or "queued"),
+            created_at=float(data.get("created_at") or time.time()),
+            started_at=_coerce_optional_float(data.get("started_at")),
+            finished_at=_coerce_optional_float(data.get("finished_at")),
+            final_response=str(data.get("final_response") or ""),
+            error=str(data.get("error") or ""),
+            api_calls=int(data.get("api_calls") or 0),
+            child_session_id=str(data.get("child_session_id") or ""),
+            cancel_requested=bool(data.get("cancel_requested") or False),
+            request=data.get("request") if isinstance(data.get("request"), dict) else {},
+        )
+    except Exception:
+        return None
+    if job.cancel_requested:
+        job.cancel_event.set()
+    job.output_events = _load_events(agent_id)
+    return job
+
+
+def _recover_orphaned_job_as_lost(job: BackgroundAgentJob) -> None:
+    if job.status in TERMINAL_STATUSES:
+        return
+    job.status = "lost"
+    job.finished_at = time.time()
+    if not job.error:
+        job.error = "Background agent orphaned during process restart; marked lost and not resumed."
+    _append_event(job, "lost", message=job.error)
+    _persist_job_metadata(job)
+
+
+def _ensure_store_loaded() -> None:
+    global _STORE_LOADED
+    with _JOBS_LOCK:
+        if _STORE_LOADED:
+            return
+        try:
+            directory = _store_dir()
+            if directory.exists():
+                for path in sorted(directory.glob("bg_*.json")):
+                    job = _load_job_from_meta(path)
+                    if job is None:
+                        continue
+                    _recover_orphaned_job_as_lost(job)
+                    _JOBS.setdefault(job.agent_id, job)
+        finally:
+            _STORE_LOADED = True
+        _prune_retained_jobs()
 
 
 def _matching_jobs(parent_agent: Any = None) -> List[BackgroundAgentJob]:
+    _ensure_store_loaded()
     sid = _parent_session_id(parent_agent)
     with _JOBS_LOCK:
         jobs = list(_JOBS.values())
@@ -138,6 +292,11 @@ def _prune_retained_jobs() -> None:
         while len(_JOBS) > max_retained and terminal:
             victim = terminal.pop(0)
             _JOBS.pop(victim.agent_id, None)
+            try:
+                _job_meta_path(victim.agent_id).unlink(missing_ok=True)
+                _job_events_path(victim.agent_id).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _running_count(parent_agent: Any = None) -> int:
@@ -162,6 +321,7 @@ def _run_delegate_task_for_job(job: BackgroundAgentJob, parent_agent: Any) -> Di
     from tools.delegate_tool import delegate_task
 
     req = dict(job.request)
+    req["_cancel_event"] = job.cancel_event
     return json.loads(delegate_task(parent_agent=parent_agent, **req))
 
 
@@ -174,22 +334,32 @@ def _worker(job_id: str, parent_agent: Any) -> None:
             job.status = "cancelled"
             job.finished_at = time.time()
             _append_event(job, "cancelled", message="Cancelled before start")
+            _persist_job_metadata(job)
+            _prune_retained_jobs()
             return
         job.status = "running"
         job.started_at = time.time()
         _append_event(job, "started")
+        _persist_job_metadata(job)
     try:
         result = _run_delegate_task_for_job(job, parent_agent)
         with _JOBS_LOCK:
             job = _JOBS.get(job_id)
             if not job:
                 return
+            if job.cancel_requested:
+                job.status = "cancelled"
+                job.finished_at = time.time()
+                _append_event(job, "cancelled", message="Cancelled during delegate execution")
+                _persist_job_metadata(job)
+                return
             job.api_calls = int(result.get("api_calls") or 0)
             job.child_session_id = str(result.get("child_session_id") or "")
             job.final_response = json.dumps(result, ensure_ascii=False, default=str)
-            job.status = "cancelled" if job.cancel_requested else "completed"
+            job.status = "completed"
             job.finished_at = time.time()
             _append_event(job, job.status, result=result)
+            _persist_job_metadata(job)
     except Exception as exc:
         with _JOBS_LOCK:
             job = _JOBS.get(job_id)
@@ -199,6 +369,7 @@ def _worker(job_id: str, parent_agent: Any) -> None:
             job.status = "cancelled" if job.cancel_requested else "failed"
             job.finished_at = time.time()
             _append_event(job, job.status, error=str(exc))
+            _persist_job_metadata(job)
     finally:
         _prune_retained_jobs()
 
@@ -230,6 +401,7 @@ def background_agent_tool(
     action = str(action or "").strip().lower()
     if action not in {"create", "list", "status", "output", "cancel"}:
         return _json({"success": False, "error": "Unknown background_agent action"})
+    _ensure_store_loaded()
 
     if action == "list":
         return _json({
@@ -248,11 +420,23 @@ def background_agent_tool(
                 if job.status in TERMINAL_STATUSES:
                     return _json({"success": True, "job": job.public_dict(include_output=True), "message": "Job already finished"})
                 job.cancel_requested = True
+                job.cancel_event.set()
                 job.status = "cancelling"
                 _append_event(job, "cancel_requested")
                 fut = job.future
+                cancelled_before_start = False
                 if fut is not None:
-                    fut.cancel()
+                    try:
+                        cancelled_before_start = bool(fut.cancel())
+                    except Exception:
+                        cancelled_before_start = False
+                if cancelled_before_start:
+                    job.status = "cancelled"
+                    job.finished_at = time.time()
+                    _append_event(job, "cancelled", message="Cancelled before start")
+                _persist_job_metadata(job)
+                if cancelled_before_start:
+                    _prune_retained_jobs()
                 return _json({"success": True, "job": job.public_dict(), "message": "Cancellation requested"})
             return _json({
                 "success": True,
@@ -296,6 +480,8 @@ def background_agent_tool(
         request=req,
     )
     _append_event(job, "created")
+    job.request["_cancel_event"] = job.cancel_event
+    _persist_job_metadata(job)
     with _JOBS_LOCK:
         _JOBS[job.agent_id] = job
         job.future = _EXECUTOR.submit(_worker, job.agent_id, parent_agent)
@@ -310,9 +496,13 @@ def _handle_background_agent(args: Dict[str, Any], **kw: Any) -> str:
 
 
 def _reset_background_agent_registry() -> None:
-    """Test helper: clear in-process jobs."""
+    """Test helper: clear in-process jobs without deleting durable job artifacts."""
+    global _STORE_LOADED
     with _JOBS_LOCK:
         _JOBS.clear()
+        # Unit tests start from an empty in-memory registry by default. Tests
+        # that exercise durable recovery explicitly set this back to False.
+        _STORE_LOADED = True
 
 
 BACKGROUND_AGENT_SCHEMA = {
