@@ -1766,6 +1766,7 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    cancel_event: Optional[threading.Event] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -1954,7 +1955,40 @@ def _run_single_child(
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
-            result = _child_future.result(timeout=child_timeout)
+            deadline = time.monotonic() + float(child_timeout)
+            result = None
+            cancel_seen = False
+            while True:
+                if cancel_event is not None and cancel_event.is_set() and not cancel_seen:
+                    cancel_seen = True
+                    try:
+                        if hasattr(child, "interrupt"):
+                            child.interrupt("Background agent cancellation requested")
+                        elif hasattr(child, "_interrupt_requested"):
+                            child._interrupt_requested = True
+                    except Exception:
+                        pass
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise FuturesTimeoutError()
+                try:
+                    result = _child_future.result(timeout=min(0.25, remaining))
+                    if cancel_seen:
+                        duration = round(time.monotonic() - child_start, 2)
+                        return {
+                            "task_index": task_index,
+                            "status": "interrupted",
+                            "summary": None,
+                            "error": "Background agent cancellation requested",
+                            "exit_reason": "interrupted",
+                            "api_calls": result.get("api_calls", 0) if isinstance(result, dict) else 0,
+                            "duration_seconds": duration,
+                            **_delegate_child_lineage_fields(child),
+                            "_child_role": getattr(child, "_delegate_role", None),
+                        }
+                    break
+                except FuturesTimeoutError:
+                    continue
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2382,6 +2416,7 @@ def delegate_task(
     task_contract: Optional[Dict[str, Any]] = None,
     named_workflow: Optional[Dict[str, Any]] = None,
     parent_agent=None,
+    _cancel_event: Optional[threading.Event] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2602,7 +2637,7 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(0, _t["goal"], child, parent_agent, cancel_event=_cancel_event)
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -2618,6 +2653,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    cancel_event=_cancel_event,
                 )
                 futures[future] = i
 
